@@ -19,8 +19,10 @@
    configures Claude or Codex separately.
 4. **A keyed row is never worked in another task's session.** If a switch can't happen, the row waits and the reason is
    visible. If the task's session is gone, the task gets a fresh session and the seat is told how to recover.
-5. **How a new task session starts is an option:** `restart` (relaunch in place, the default) or `agent_image` (fork a
-   named agent image, so each task starts from a primed conversation).
+5. **How a new task session starts is an option:** `agent_image` (fork the seat's own agent image, the one its
+   existing `session_source` names) or `restart` (relaunch in place, blank). The default follows how the seat
+   launches: `agent_image` on a seat with an image, `restart` otherwise. A task never picks an image and never changes
+   the seat's.
 6. **A person at the seat is protected like any managed input.** A switch goes through the same draft and typing
    guards as the compaction enforcer's `/compact`. There's no separate waiting period.
 7. **Retention defaults to 28 days for both runtimes.** For Claude it's capped below Claude's own transcript cleanup.
@@ -234,14 +236,14 @@ flowchart LR
 
 | Decision | Choice | Why |
 |---|---|---|
-| Configuration | `sessions:` block on the rig and on members: `scope`, `cache_ttl`, `retention_days`, `fresh_start`, `agent_image` | One place (decisions 3 and 13) |
+| Configuration | `sessions:` block on the rig and on members: `scope`, `cache_ttl`, `retention_days`, `fresh_start` | One place (decisions 3 and 13) |
 | Key storage | `queue_items.task_key` column | Tags are replaced by `--tags` on handoff. A column carries explicitly, like `return_route` (migration 172). |
 | Keyless work rows | A generated `t-<ULID>` key, shown to the sender | Decision 2 |
 | Map key | `(group_id, task_key)`, one holder at a time | `sessions` rows are superseded on every relaunch, and a pool shares a task's session across members |
 | Where the hold happens | `deliverWakeIntent` `claim`, beside `deliveryDrains.holds` | No attempt spent. It survives a restart through the boot drain. |
 | Correctness at write time | Each wake carries its expected task. `guard.operation` re-checks it under the per-seat lock. | A wake that passed the gate earlier can't land after a switch (§7.3) |
 | Claude resume | `/resume ID` typed in the pane, confirmed by exact id. Relaunch `--resume ID` is the fallback. | Same process, flags and env. Proven in the spike (Appendix A). |
-| Fresh session | Relaunch in place: Claude with a pre-generated `--session-id`, Codex plain, or a fork of an agent image. A pristine launch session is adopted instead. | `/clear` drops the startup guidance typed in at launch |
+| Fresh session | Relaunch in place: Claude with a pre-generated `--session-id`, Codex plain, or a fork of the seat's own agent image. A pristine launch session is adopted instead. | `/clear` drops the startup guidance typed in at launch |
 | Codex resume | Relaunch in place with `codex resume ID` | Codex's in-TUI `/resume` is a picker |
 | Row shows session | `queue_items.task_session_ref` = map entry id | Native ids stay out of diagnostics (`daemon-http-clients.md:343`) |
 | Before every resume | Preflight: the native file exists, nobody else holds the id, same runtime, cwd and home | Cheap checks that avoid most resume failures |
@@ -261,10 +263,13 @@ pods:
     members:
       - id: review
         runtime: claude-code
+        session_source:         # existing key: the seat launches as a fork of this image
+          mode: agent_image
+          ref: { kind: image_name, value: reviewer-primed, version: "2" }
         sessions:               # member override, key by key (optional)
-          retention_days: 21
-          fresh_start: agent_image
-          agent_image: reviewer-primed
+          retention_days: 21    # fresh_start defaults to agent_image here: each task forks reviewer-primed v2
+      - id: build
+        runtime: claude-code    # no image: fresh_start defaults to restart
       - id: notes
         runtime: terminal       # not supported: the rig default skips it, with an advisory
 ```
@@ -274,8 +279,12 @@ pods:
 | `scope` | `shared` (default), `per-task` | `claude-code`, `codex` | Per-task switching. On a member's own block, an unsupported runtime is a validation error. From the rig-wide default, it's skipped with an advisory. |
 | `cache_ttl` | `5m`, `1h` | any Claude seat, shared or per-task | Sets `CLAUDE_CODE_PROMPT_CACHE_TTL` in the launch env (§7.9). On Codex: an advisory, not applied. |
 | `retention_days` | integer ≥ 1 | per-task seats | How long an unused entry stays resumable. Default and cap come from the runtime lifetime (§7.10). |
-| `fresh_start` | `restart` (default), `agent_image` | per-task seats | How a new task's session starts (§7.6) |
-| `agent_image` | an agent image name (`rig agent-image`) of the seat's runtime | when `fresh_start: agent_image` | The image each new task forks. Validated at `rig up`: it exists and has the same runtime. |
+| `fresh_start` | `agent_image`, `restart`. Default: `agent_image` when the member has `session_source.mode: agent_image`, otherwise `restart`. | per-task seats | How a new task's session starts (§7.6). `agent_image` forks the image the seat's own `session_source` names, at its pinned version. `restart` gives a blank session even on a seat with an image. On a member's own block, `agent_image` without an image `session_source` is a validation error. From the rig-wide default, such a member gets `restart`, with an advisory. |
+
+- **One image per seat.** There's no image key under `sessions:`. The image is the seat's `session_source`, which
+  already exists (`rigspec-schema.ts:803`, stored as `nodes.session_source_json`). Changing it is what it is today:
+  edit the spec, then relaunch the seat. A task arriving never changes it. A pool slot uses its model seat's
+  `session_source`.
 
 - **Validation:** `rigspec-schema.ts` adds `sessions` to `RIG_KEYS` (`:69`) and `MEMBER_KEYS` (`:74`), with value
   checks in `validateMember` (`:515`) following `restore_policy` (`:684`).
@@ -334,7 +343,7 @@ result returns the resolved key. The zod input schemas carry it, and `c/test/mcp
 ### 6.5 Database: migration `179_task_sessions.ts`
 
 ```sql
-ALTER TABLE nodes ADD COLUMN session_policy TEXT;           -- JSON {scope, cache_ttl, retention_days, fresh_start, agent_image}
+ALTER TABLE nodes ADD COLUMN session_policy TEXT;           -- JSON {scope, cache_ttl, retention_days, fresh_start}, fresh_start resolved
 ALTER TABLE queue_items ADD COLUMN task_key TEXT;
 ALTER TABLE queue_items ADD COLUMN task_key_origin TEXT;    -- explicit | inherited | handoff | thread | workflow | generated
 ALTER TABLE queue_items ADD COLUMN task_session_ref TEXT;   -- seat_task_sessions.id that worked the row
@@ -575,13 +584,13 @@ All of these must hold, read under the lifecycle lock just before acting:
 
 | Runtime | Resume an entry | Start fresh: `restart` | Start fresh: `agent_image` |
 |---|---|---|---|
-| Claude | **Typed:** `/resume ID` via `SessionTransport.send` under the lock, with the enforcer's options (`allowDraftWhileIdle: false`, `beforeWrite`, `waitForIdleMs`). Confirmed only by SessionStart `source=resume` carrying **exactly** ID, from this generation, after `armed_at`. It proceeds the moment the hook arrives (about 4 s in the spike), and 20 s is the ceiling. **Fallback:** relaunch in place with `--resume ID`, the provider-switch path (`d/domain/provider/claude-seat-switch.ts`, `relaunchInPane` call at `:145`, `restore-orchestrator.ts:launchSingleNode:728`). | Relaunch in place with a pre-generated `--session-id` (`claude-code-adapter.ts:499`). The full startup replays the seat's guidance. Candidate path: handover `freshInPlace` (`successor-session-launcher.ts:496`). | Relaunch in place as a fork: `claude --resume IMAGE_ID --fork-session --session-id NEW`, the fork branch at `claude-code-adapter.ts:461-496`. The image stays untouched. |
+| Claude | **Typed:** `/resume ID` via `SessionTransport.send` under the lock, with the enforcer's options (`allowDraftWhileIdle: false`, `beforeWrite`, `waitForIdleMs`). Confirmed only by SessionStart `source=resume` carrying **exactly** ID, from this generation, after `armed_at`. It proceeds the moment the hook arrives (about 4 s in the spike), and 20 s is the ceiling. **Fallback:** relaunch in place with `--resume ID`, the provider-switch path (`d/domain/provider/claude-seat-switch.ts`, `relaunchInPane` call at `:145`, `restore-orchestrator.ts:launchSingleNode:728`). | Relaunch in place with a pre-generated `--session-id` (`claude-code-adapter.ts:499`). The full startup replays the seat's guidance. Candidate path: handover `freshInPlace` (`successor-session-launcher.ts:496`). | Relaunch in place as a fork of the seat's image: `claude --resume IMAGE_ID --fork-session --session-id NEW`, the fork branch at `claude-code-adapter.ts:461-496`. `IMAGE_ID` is the image's `sourceResumeToken`, resolved from `nodes.session_source_json` by name and version exactly as at launch (`rigspec-instantiator.ts:2853`). The image stays untouched. |
 | Codex | **Relaunch in place:** `CodexInPlaceRestart` (`seat-restart-in-place.ts:213`, `execute:246`) generalised to take a target id, using its shell-backed path, which keeps the seat env. `codex resume ID` keeps the id. | Relaunch in place without resume. The id arrives with the SessionStart hook. | Codex's native fork of the image thread (`agent-images/resume-token-discovery.ts`) |
-| Either | **Adopt:** when the seat is on its pristine session and holds nothing, that session becomes the task's. No relaunch. Not used with `agent_image`. | | |
+| Either | **Adopt:** when the seat is on its pristine session and holds nothing, that session becomes the task's. No relaunch. Only when the pristine session started the way `fresh_start` would start one: an image fork for `agent_image`, a plain launch for `restart`. | | |
 
-**Pristine, precisely:** the seat's current occupancy was launched fresh by OpenRig and confirmed by SessionStart
-`startup` with the pre-generated id. Since then, no turn has run other than the startup sequence, and no row has been
-claimed by its generation. A person typing into it starts a turn, so the session is no longer pristine.
+**Pristine, precisely:** the seat's current occupancy was launched fresh (or as a fork of its image) by OpenRig and
+confirmed by SessionStart with the pre-generated id. Since then, no turn has run other than the startup sequence, and
+no row has been claimed by its generation. A person typing into it starts a turn, so the session is no longer pristine.
 
 **Why fresh isn't `/clear`:**
 - A seat's startup sends `send_text` files and `after_ready` actions as conversation input
@@ -899,7 +908,7 @@ There are two kinds of failure, handled differently:
 | C6 | Runtime changed (Claude ↔ Codex) | `runtime` | Retire `runtime_changed` (every entry of the old runtime), fresh | Same |
 | C7 | The native id is any other node's current `resume_token`, or an entry another member holds | Preflight query | Never resume it, because two processes on one session lose messages (spike step 6). Retire `held_elsewhere`, fresh. | Same, `held_elsewhere` |
 | C8 | Entry retired by the sweep while a row waited | Map | Fresh | `new session (… retention)` |
-| C9 | `fresh_start: agent_image`, but the image is missing, retired, of another runtime, or its session is gone | Preflight on the image | This task starts with `restart` instead. Nothing is retired. | `new session (agent image unavailable: REASON)` |
+| C9 | `fresh_start: agent_image`, but the seat's image was removed, retired or its session is gone since the seat launched | Preflight on the image | This task starts with `restart` instead. Nothing is retired. | `new session (agent image unavailable: REASON)` |
 
 ### 9.4 Switching: act and confirm
 
@@ -1152,7 +1161,7 @@ flowchart TD
 | T-retention | 28-day default, Claude `L − 2` and cap at `L − 1` with an advisory, sweep skips held and armed entries | Unit with fake settings |
 | T-cache | `cache_ttl` → launch env on fresh, restore and relaunch. Codex advisory. Effective window reported. Rig default plus member override. | Unit on launch env, plus `rigspec-schema` tests |
 | T-pool | §7.11 rules 1–4, P1–P9 with fake `seat_pool_slots`, and `chooseMember` returning the model seat while no pool is armed | Unit on the router, plus a scenario with two stub slots |
-| T-image | `agent_image` forks with a pre-generated id, the image stays unchanged, and C9 falls back to `restart` | Unit on the mechanism. Scenario with a stub image. |
+| T-image | `agent_image` forks the seat's own `session_source` image at its pinned version, with a pre-generated id, and the image stays unchanged. The default resolves to `agent_image` on an image seat and to `restart` otherwise. `agent_image` without an image is a validation error on a member block and `restart` with an advisory from the rig default. Adopt only matches a launch of the same kind. C9 falls back to `restart`. | Unit on the mechanism. Scenario with a stub image. |
 | T-migration | Parity and mirror | `migration-fixture-parity.test.ts`, `startup-migrations-mirror.test.ts` |
 
 **Real-runtime check:** the delivery artery isn't stub-coverable (`arteries.md:76`). So PR 4 also states a manual run
@@ -1182,7 +1191,8 @@ restore have no scenario coverage today (`:76`, `:84`).
 1. **The error strings in §9.5** come from today's detectors, the spike and the runtimes' docs. New Claude and Codex
    versions will add more. Keep the classifier in one module, with a test per string.
 2. **`fresh_start: agent_image`: which startup actions a fork launch replays.** The image's conversation should
-   already hold the seat's guidance. Check that the fork path doesn't type it a second time.
+   already hold the seat's guidance. Check that the fork path doesn't type it a second time. Also check which
+   SessionStart `source` Claude and Codex report for a fork launch, so the pristine check for adopt matches it.
 3. **Ordering by cache warmth** (spec Q4): out of scope. The data for it (`prompt_cache.expires_at`) is now recorded.
 4. **ACP `--load-session`:** out of scope.
 
@@ -1204,7 +1214,8 @@ restore have no scenario coverage today (`:76`, `:84`).
 6. **Pool affinity.** `TaskAffinityRouter.chooseMember`, group-level holding across members, and the drain and add
    rules. If upstream's pool job is armed by then, it calls the router. If not, the router ships ready and returns the
    model seat.
-7. **`fresh_start: agent_image`.**
+7. **`fresh_start: agent_image`,** and the image-aware default. Until it lands, `fresh_start` accepts only `restart`,
+   which is every seat's default.
 
 ---
 
