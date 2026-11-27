@@ -1692,6 +1692,8 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
         }
         const refusal = res.status >= 400 ? provenCreateRefusal(res.status, res.data) : null;
         if (refusal) console.error(`No row was created: ${refusal}`);
+        // Any other error may follow a commit: --id-only gives the recovery its short notice left out.
+        else if (idOnly && res.status >= 400) console.error(requestNotice);
         const hint = hostSubstitutionHint(res.status, res.data, opts.destination, opts.host, hostResolved, `, keeping --id ${shellQuote(qitemId)}`);
         if (hint) console.error(hint);
         await finish(res.data, res.status);
