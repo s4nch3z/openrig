@@ -43,7 +43,7 @@ Five host-scoped tables back the primitive, one per migration `023`–`027` in
   `067_i3_identity_provenance.ts`). Items immutable after emit (only
   `archived_at` may be set, `stream-store.ts:217`).
 - **`queue_items`** (`024_queue_items.ts`) — L3 owned-work queue.
-  Unless `--id` is supplied, the CLI generates the create request's `qitem_id` (TEXT PK) before sending as `qitem-<UTC YYYYMMDDHHMMSS>-<16 hex>` (64 random bits) and prints it to stderr as a request identity, not proof of persistence; reuse that ID with `--id` and the unchanged payload after an unknown outcome, while daemon callers without an ID still use `newQitemId()` and its `qitem-<UTC YYYYMMDDHHMMSS>-<8 hex>` form.
+  Unless `--id` is supplied, the CLI generates the create request's `qitem_id` (TEXT PK) before sending as `qitem-<UTC YYYYMMDDHHMMSS>-<16 hex>` (64 random bits) and prints it to stderr as a request identity, not proof of persistence; reuse that ID with `--id` and the unchanged payload after an unknown outcome, while daemon callers without an ID still use `newQitemId()` and its `qitem-<UTC YYYYMMDDHHMMSS>-<8 hex>` form. `create --id-only` (alias `--quiet`) shortens that stderr line to `Request ID (unconfirmed): <id>` and prints the ID on stdout only when the daemon's reply names that same row.
   State enum (**8** values, `QUEUE_STATES` at `queue-repository.ts:33`;
   `sed -n '/^export const QUEUE_STATES/,/] as const/p' packages/daemon/src/domain/queue-repository.ts | grep -c '^  "'`):
   `pending | in-progress | done | blocked | failed | denied | canceled |
@@ -128,6 +128,43 @@ wake result later. If create cannot retain the intent, the task is still saved
 and the row records `failed:wake not retained: <reason>`. Startup reconciles
 and drains intents left pending by a crash once (`startup.ts:2361`–`2362`).
 `maybeNudge` remains only as the path for a repository with no outbox.
+
+**What a wake carries.** (Renderer, typed delivery and copied-body reads checked
+against `f2b2cafbdc95ac20d6471676ff70aebd81e96758`.) A wake to an agent
+seat carries its row's body under the header (`renderQueueWakeBody`,
+`queue-nudge-text.ts`), with a completeness line and an indented block. C0
+controls other than newline, DEL and C1, invisible format characters, line and
+paragraph separators and lone surrogates are shown escaped. The rendered block
+is at most `QUEUE_WAKE_BODY_MAX_BYTES` (4096 bytes), indentation and escapes
+included; a longer body is cut between whole characters and reads
+`Body: preview; not automatically claimed`, followed by the full-read command.
+An authored empty body is complete; an erased body is unavailable. Typed
+coalesced sends include only their primary member's body; other members name
+their rows and say the body was not included. Erasure scrubs stored wake copies;
+seat reads of a copy whose queue row is absent omit its text with
+`bodyHeld: qitem_unavailable` (`wakeCopyBodyGate`, queue and seat routes).
+
+**A refused wake paste.** (Checked against
+`b4698289cd397b42c02989df979b14e0c051c493`.) Migration
+`195_seat_input_residue` adds durable metadata records for a queue wake pasted
+before its final check refused Enter (`draft_wake_superseded`). The original
+result remains `sent: true`, `inputPhase: written`; text is left in the input.
+The records store the node, session, pane, observed pane PID, occupant and
+outbox ID, never the body, and survive erasure of the outbox row. Receiver PIDs
+are sampled around the paste. Every distinct sample retains its own hold,
+including an unknown-process hold when a sample failed, so a later observation
+cannot assign old bytes to a new receiver or replace another input's hold.
+
+Before a later automatic paste or submit-only Enter,
+`SessionTransport.inputResidueHold` reads the input. A typed input is held as
+`draft_input_busy`; an unreadable one as `draft_input_unknown`. Nothing is
+automatically removed. Positive empty-input evidence permits the send; it
+clears only the record matching the known current pane PID. A different known
+pane PID permits that receiver's send while retaining the old process's hold,
+unless an unknown-process hold also applies. Tenure or pane-label drift alone
+does not release it. Unknown-process records remain conservative: an empty
+input permits a send without clearing that record. Explicit deliberate
+interaction bypasses this automatic-input hold.
 
 **Which field answers "did it reach them".** `deliveryOutcome` is the gateway
 (human-delivery) ledger, derived at read time
