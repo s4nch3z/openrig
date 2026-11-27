@@ -2506,8 +2506,8 @@ export class SessionTransport {
       : [{ outboxId: ids[0]!, auditPointer: opts.auditPointer ?? null, destinationSession: sessionName }];
   }
 
-  /** A queue wake's text was pasted, then its Enter refused because the wake no longer applied: the text may stay in the
-   *  input of the pane process that received it. One hold per such process (each one read around the paste; a read that
+  /** A queue wake's text was pasted, then its Enter wasn't sent (the wake no longer applied, the seat's binding changed,
+   *  another check refused it): the text may stay in the input of the pane process that received it. One hold per such process (each one read around the paste; a read that
    *  failed adds an unknown-process hold, since the other read doesn't prove where the text went), keeping where it went,
    *  never the text; erasure doesn't clear it. */
   private async holdInputResidue(sessionName: string, meta: { nodeId: string | null; pane: string | null; occupant: string | null }, receivers: Array<number | null> | null, opts: SendOpts | undefined): Promise<void> {
@@ -2540,7 +2540,7 @@ export class SessionTransport {
     }
     const readable = box?.status === "typed" || box?.status === "typed-with-suggestion";
     return { held: box, result: { ok: false, sessionName, sent: false, inputPhase: "not_reached", reason: readable ? "draft_input_busy" : "draft_input_unknown",
-      error: `Held: a queue wake's text was pasted into '${sessionName}', then its Enter was withheld because the wake no longer applied (its row was erased or settled), so that text may still be in the input (it reads ${box?.status ?? "unknown"}). Nothing was sent. Clear the seat's input in its terminal; the next automatic send then finds it empty and goes ahead. A send to a new pane process for the seat isn't held.` } };
+      error: `Held: a queue wake's text was pasted into '${sessionName}', then its Enter was withheld (the wake no longer applied, or the seat changed), so that text may still be in the input (it reads ${box?.status ?? "unknown"}). Nothing was sent. Clear the seat's input in its terminal; the next automatic send then finds it empty and goes ahead. A send to a new pane process for the seat isn't held.` } };
   }
 
   attachRuntimeAdapters(adapters: Record<string, TransportReadinessChecker>): void {
@@ -4288,7 +4288,10 @@ export class SessionTransport {
           reading: readInputBox(read?.[1] ?? null, inputBoxRuntime, text), pid: read?.[0] ?? null, pane: read?.[1] ?? null };
       }
 
-      if (runtime === "claude-code" && bindingChanged()) return observe(changedRecipient(true));
+      if (runtime === "claude-code" && bindingChanged()) {
+        await this.holdInputResidue(sessionName, sessionMeta, receivers, opts);
+        return observe(changedRecipient(true));
+      }
 
       if (promptOverride) {
         const pane = await this.runStage("session_transport.prompt_override_pre_submit_capture",
@@ -4321,7 +4324,7 @@ export class SessionTransport {
       );
       if (!submitResult.ok) {
         const policyRefusal = typeof submitResult.code === "string" && (submitResult.code.startsWith("expected_identity_") || submitResult.code.startsWith("draft_") || submitResult.code === "managed_compaction_pending");
-        if (submitResult.code === "draft_wake_superseded") await this.holdInputResidue(sessionName, sessionMeta, receivers, opts);
+        if (policyRefusal || !enterIssued) await this.holdInputResidue(sessionName, sessionMeta, receivers, opts);
         return observe({
           ok: false,
           sessionName,
@@ -4337,7 +4340,7 @@ export class SessionTransport {
       }
     } catch (error) {
       if (error && typeof error === "object") Object.assign(error, { inputWritten: true, enterAttempted: enterIssued });
-      if (!enterIssued && error instanceof DeliveryGuardError && error.code === "draft_wake_superseded") await this.holdInputResidue(sessionName, sessionMeta, receivers, opts);
+      if (!enterIssued || error instanceof DeliveryGuardError) await this.holdInputResidue(sessionName, sessionMeta, receivers, opts);
       throw error;
     }
     try { opts?.onInputEffect?.("submitted"); } catch { /* Observation cannot change a completed submission. */ }
