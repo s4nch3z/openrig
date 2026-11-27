@@ -15,7 +15,8 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { eraseQueue } from "../src/domain/queue-erasure.js";
 
-async function heldSeat(onErase?: (seat: { rootPid: number; screen: string }) => void) {
+async function heldSeat(onErase?: (seat: { rootPid: number; screen: string }) => void,
+  aroundPaste?: { onPaste: (seat: { rootPid: number; screen: string }) => void; unknownBeforePaste?: boolean }) {
   const db = new Database(":memory:"); migrate(db, ALL_MIGRATIONS);
   db.exec(`INSERT INTO rigs(id,name) VALUES ('r','test');
     INSERT INTO nodes(id,rig_id,logical_id,runtime) VALUES ('a','r','worker','claude-code');
@@ -28,19 +29,24 @@ async function heldSeat(onErase?: (seat: { rootPid: number; screen: string }) =>
   const row = await repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "BODY-ERASED-BEFORE-ENTER" });
   const seat = { rootPid: 10, screen: "", cursor: null as { x: number; y: number; width: number; height: number } | null, loaded: "", pasted: [] as string[], submitted: [] as string[] };
   let eraseId: string | null = row.qitemId;
+  let pasteChanged = false;
   // Each transport is a daemon run: the hold must come from the database, not from the transport that recorded it.
   const daemon = () => {
     const tmux = new TmuxAdapter(async command => {
       const line = String(command);
       const buffer = /load-buffer .* '([^']+)'$/.exec(line);
       if (buffer) seat.loaded = readFileSync(buffer[1]!, "utf8");
-      if (line.includes("paste-buffer")) { seat.pasted.push(seat.loaded); seat.screen += seat.loaded; }
+      if (line.includes("paste-buffer")) {
+        seat.pasted.push(seat.loaded); seat.screen += seat.loaded;
+        if (aroundPaste && !pasteChanged) { pasteChanged = true; aroundPaste.onPaste(seat); }
+      }
       if (line.includes("send-keys") && line.includes("Enter")) seat.submitted.push(seat.screen);
       return line.includes("capture-pane") ? seat.screen : "";
     });
     tmux.deliveryGuard = new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name));
     vi.spyOn(tmux, "probeSession").mockResolvedValue({ state: "present" });
-    vi.spyOn(tmux, "getPanePid").mockImplementation(async () => seat.rootPid);
+    vi.spyOn(tmux, "getPanePid").mockImplementation(async () =>
+      aroundPaste?.unknownBeforePaste && seat.pasted.length === 0 ? null : seat.rootPid);
     vi.spyOn(tmux, "getPaneCommand").mockResolvedValue("claude");
     vi.spyOn(tmux, "listPanes").mockResolvedValue([{ id: "%1" } as never]);
     vi.spyOn(tmux, "getPaneCursorPosition").mockImplementation(async () => seat.cursor);
@@ -166,6 +172,28 @@ describe("known refused own-wake residue belongs to its physical input", () => {
       f.seat.rootPid = 10;
       f.seat.screen = originalInput;
       const back = await f.daemon().send("worker@test", "FOLLOWUP-PASTED-RECEIVER");
+      expect.soft(back).toMatchObject({ ok: false, sent: false, inputPhase: "not_reached" });
+      expect.soft(f.seat.screen).toBe(originalInput);
+      expect.soft(f.seat.submitted).toEqual([]);
+    } finally { f.db.close(); vi.restoreAllMocks(); }
+  });
+
+  it.each([false, true])("receiver change stays conservative (unknown before paste: %s)", async unknownBeforePaste => {
+    let originalInput = "";
+    const f = await heldSeat(undefined, {
+      unknownBeforePaste,
+      onPaste: seat => {
+        originalInput = seat.screen;
+        seat.rootPid = 11;
+        seat.screen = "another receiver's output\n";
+      },
+    });
+    try {
+      expect(originalInput).toContain("BODY-ERASED-BEFORE-ENTER");
+      expect(f.wakeResult).toMatchObject({ sent: true, inputPhase: "written", reason: "draft_wake_superseded" });
+      f.seat.rootPid = 10;
+      f.seat.screen = originalInput;
+      const back = await f.daemon().send("worker@test", "FOLLOWUP-AFTER-PARTIAL-READ");
       expect.soft(back).toMatchObject({ ok: false, sent: false, inputPhase: "not_reached" });
       expect.soft(f.seat.screen).toBe(originalInput);
       expect.soft(f.seat.submitted).toEqual([]);

@@ -2483,13 +2483,13 @@ export class SessionTransport {
   }
 
   /** A queue wake's text was pasted, then its Enter refused because the wake no longer applied: the text may stay in the
-   *  input of the pane process that received it. One hold per such process (each one read around the paste; unknown when
-   *  neither was read), keeping where it went, never the text; erasure doesn't clear it. */
+   *  input of the pane process that received it. One hold per such process (each one read around the paste; a read that
+   *  failed adds an unknown-process hold, since the other read doesn't prove where the text went), keeping where it went,
+   *  never the text; erasure doesn't clear it. */
   private async holdInputResidue(sessionName: string, meta: { nodeId: string | null; pane: string | null; occupant: string | null }, receivers: Array<number | null> | null, opts: SendOpts | undefined): Promise<void> {
     if (!meta.nodeId || !receivers) return;
-    const known = [...new Set(receivers.filter((pid): pid is number => pid !== null))];
     this.db.transaction(() => {
-      for (const pid of known.length > 0 ? known : [null]) {
+      for (const pid of new Set(receivers)) {
         this.db.prepare("DELETE FROM seat_input_residue WHERE node_id = ? AND pane_pid IS ?").run(meta.nodeId, pid);
         this.db.prepare("INSERT INTO seat_input_residue (node_id, session_name, pane, pane_pid, occupant, outbox_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
           .run(meta.nodeId, sessionName, meta.pane, pid, meta.occupant, opts?.committedOutboxIds?.[0] ?? opts?.deliveryId ?? null, this.now().toISOString());
