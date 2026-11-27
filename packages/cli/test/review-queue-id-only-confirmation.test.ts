@@ -25,7 +25,7 @@ describe("id-only stdout requires confirmation of this request", () => {
   afterEach(() => {
     vi.restoreAllMocks(); vi.unstubAllEnvs(); fs.rmSync(home, { recursive: true, force: true }); process.exitCode = undefined;
   });
-  async function run(reply: Record<string, unknown>, recovered = false) {
+  async function run(reply: Record<string, unknown>, recovered = false, claimOnWake = false) {
     const posts = vi.fn(async () => ({ status: 201, data: reply }));
     const gets = vi.fn(async () => recovered ? { status: 200, data: ROW } : { status: 404, data: { error: "qitem_not_found" } });
     const deps: QueueDeps = { lifecycleDeps: {} as QueueDeps["lifecycleDeps"],
@@ -33,7 +33,7 @@ describe("id-only stdout requires confirmation of this request", () => {
         senderIdentity: async () => ({ session: "lead@rig", originUnknown: false }) }) as unknown as ReturnType<QueueDeps["clientFactory"]> };
     const program = createProgram({ queueDeps: deps }); program.exitOverride();
     let error: unknown;
-    try { await program.parseAsync(["node", "rig", "queue", "create", "--destination", "dev@rig", "--body", "work", "--id", ID, "--id-only"]); }
+    try { await program.parseAsync(["node", "rig", "queue", "create", "--destination", "dev@rig", "--body", "work", "--id", ID, "--id-only", ...(claimOnWake ? ["--claim-on-wake"] : [])]); }
     catch (caught) { error = caught; }
     return { posts, gets, error };
   }
@@ -50,5 +50,14 @@ describe("id-only stdout requires confirmation of this request", () => {
     expect(result.gets).toHaveBeenCalledWith(`/api/queue/${ID}`, expect.anything());
     expect(stdout).toEqual([ID]);
     expect(process.exitCode ?? 0).toBe(0);
+  });
+  it.each([{}, { ...ROW, qitemId: "qitem-another-request" }])("claim-on-wake doesn't skip exact-ID confirmation/recovery for an uncorrelated 2xx: %j", async reply => {
+    const result = await run(reply, false, true);
+    expect.soft(result.posts).toHaveBeenCalledTimes(1);
+    expect.soft(result.gets).toHaveBeenCalledWith(`/api/queue/${ID}`, expect.anything());
+    expect.soft(stdout).toEqual([]);
+    expect.soft(stderr.join("\n")).toContain(`rig queue show '${ID}'`);
+    expect.soft(stderr.join("\n")).not.toContain("Row qitem-another-request was saved");
+    expect.soft(Boolean(result.error) || Number(process.exitCode ?? 0) !== 0).toBe(true);
   });
 });
