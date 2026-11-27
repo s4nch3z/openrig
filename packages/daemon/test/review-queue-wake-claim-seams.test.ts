@@ -16,7 +16,7 @@ import { ActivityGrantStore } from "../src/domain/activity-grants.js";
 import { RunnerChannel } from "../src/domain/runner-channel.js";
 import { CLAIMED_BY_WAKE_LINE, renderQueueHandoffNudge, renderQueueWakeBody } from "../src/domain/queue-nudge-text.js";
 
-async function fixture(expiresAt?: string, native = false) {
+async function fixture(expiresAt?: string, native = false, afterPaste?: (db: Database.Database) => void) {
   const db = new Database(":memory:"); migrate(db, ALL_MIGRATIONS);
   db.exec(`INSERT INTO rigs(id,name) VALUES ('r','test');
     INSERT INTO nodes(id,rig_id,logical_id,runtime) VALUES ('a','r','worker','claude-code');
@@ -29,13 +29,15 @@ async function fixture(expiresAt?: string, native = false) {
   const row = await repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "ORIGINAL-WORK", claimOnWake: true, expiresAt });
   let loaded = "", pane = "";
   const pasted: Array<{ text: string; state: string }> = [];
+  const submitted: string[] = [];
   const atLoad: string[] = [];
   const state = () => repo.getById(row.qitemId)!.state;
   const guard = new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name));
   const tmux = new TmuxAdapter(async command => {
     const line = String(command), buffer = /load-buffer .* '([^']+)'$/.exec(line);
     if (buffer) { loaded = readFileSync(buffer[1]!, "utf8"); atLoad.push(state()); }
-    if (line.includes("paste-buffer")) { pasted.push({ text: loaded, state: state() }); pane += loaded; }
+    if (line.includes("paste-buffer")) { pasted.push({ text: loaded, state: state() }); pane += loaded; afterPaste?.(db); }
+    if (line.includes("send-keys") && line.includes("Enter")) submitted.push(pane);
     return line.includes("capture-pane") ? pane : "";
   });
   tmux.deliveryGuard = guard;
@@ -54,7 +56,7 @@ async function fixture(expiresAt?: string, native = false) {
   }
   const transport = new SessionTransport({ db, tmuxAdapter: tmux, rigRepo: new RigRepository(db), sessionRegistry: new SessionRegistry(db), sleep: async () => {}, ...(channel ? { runnerChannel: channel } : {}) });
   repo.attachTransport(transport);
-  return { db, repo, bus, row, pasted, atLoad, state, channel, outbox, close: () => { disconnect?.(); db.close(); vi.restoreAllMocks(); } };
+  return { db, repo, bus, row, pasted, submitted, transport, atLoad, state, channel, outbox, close: () => { disconnect?.(); db.close(); vi.restoreAllMocks(); } };
 }
 
 describe("wake claim admission remains true at its own payload", () => {
@@ -143,5 +145,30 @@ describe("wake claim admission remains true at its own payload", () => {
       expect(f.outbox.runnerReceipt(`wake-intent-${f.row.qitemId}`)).toMatchObject({ stage: "pending" });
       expect(f.state()).toBe("in-progress");
     } finally { f.close(); }
+  });
+
+  it.each(["claim fanout", "after paste"])("a stable binding refusal (%s) keeps known own-wake bytes from the next ordinary send", async changeAt => {
+    const change = (db: Database.Database) => db.exec("UPDATE sessions SET resume_type='claude_id', resume_token='changed-conversation' WHERE id='s'");
+    const f = await fixture(undefined, false, changeAt === "after paste" ? change : undefined);
+    const off = f.bus.subscribe(event => {
+      if (changeAt === "claim fanout" && event.type === "queue.claimed" && event.qitemId === f.row.qitemId) change(f.db);
+    });
+    try {
+      await f.repo.drainPendingWakeIntents();
+      if (f.pasted.length === 0 && changeAt === "claim fanout") {
+        expect(f.state()).toBe("pending");
+        expect(f.submitted).toEqual([]);
+        return; // a positive refusal before the own paste is safe too
+      }
+      expect(f.pasted).toHaveLength(1); // stable guards don't fence conversation metadata at this paste
+      expect(f.pasted[0]!.text).toContain("ORIGINAL-WORK");
+      expect(f.submitted).toEqual([]); // stable's existing binding check withheld Enter
+      expect(f.repo.getById(f.row.qitemId)!.lastNudgeWireResult).toContain("Recipient binding changed after paste");
+      expect(f.state()).toBe("in-progress"); // paste was written, so its wake claim stays
+      const next = await f.transport.send("worker@test", "FOLLOWUP");
+      expect.soft(next).toMatchObject({ ok: false, sent: false, inputPhase: "not_reached" });
+      expect.soft(f.pasted).toHaveLength(1);
+      expect.soft(f.submitted).toEqual([]); // C must keep this known refused wake out of a later submission
+    } finally { off(); f.close(); }
   });
 });
