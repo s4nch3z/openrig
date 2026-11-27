@@ -363,14 +363,14 @@ function queueListPage(headers: Headers | undefined): { limit: number; truncated
   return { limit: Number(limit), truncated: truncated === "1" };
 }
 
-function printResult(json: boolean, body: unknown, status: number): void {
+function printResult(json: boolean, body: unknown, status: number, print: (text: string) => void = console.log): void {
   if (isIndeterminateRemoteWrite(status, body)) {
     console.error("The write outcome is INDETERMINATE if the request may have reached a daemon — reconcile by ID before any retry.");
   }
   if (json) {
-    console.log(JSON.stringify(body));
+    print(JSON.stringify(body));
   } else {
-    console.log(JSON.stringify(body, null, 2));
+    print(JSON.stringify(body, null, 2));
   }
   if (status >= 400) process.exitCode = status >= 500 ? 2 : 1;
 }
@@ -1349,6 +1349,8 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .option("--verify", "Boundedly wait after persistence for the existing receipts: the gateway receipt for a person, or the wake result and any claim already present for a seat, plus the gateway receipt when the gateway may also post to that seat (a registered person with a pane; eligible to post, not guaranteed). Never retries the create or the wake, and never claims the message was read")
     .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
     .option("--json", "JSON output for agents")
+    .option("--id-only", "Print only the created row's ID on stdout, once the daemon confirms the row. Before sending, stderr gets one short line with the request's ID (not yet confirmed); full recovery guidance appears only when the outcome is unknown. Warnings and --verify's delivery receipt still go to stderr. Not with --json or --full")
+    .option("--quiet", "Same as --id-only")
     .action(async (opts: {
       source?: string;
       destination: string;
@@ -1377,7 +1379,17 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       verify?: boolean;
       json?: boolean;
       full?: boolean;
+      idOnly?: boolean;
+      quiet?: boolean;
     }) => {
+      const idOnly = opts.idOnly === true || opts.quiet === true;
+      if (idOnly && (opts.json || opts.full)) {
+        const message = "id_only_format_conflict: --id-only (or --quiet) prints only the created row's ID, so it can't be combined with --json or --full. Nothing was sent.";
+        if (opts.json) console.error(JSON.stringify({ error: "id_only_format_conflict", message }));
+        else console.error(message);
+        process.exitCode = 1;
+        return;
+      }
       // OPR.0.4.6.MH3 D-3 (C3): resolve the host qualifier at the CLI edge —
       // the 3-part form never leaves the CLI; the request carries the 2-part
       // destination + the out-of-band hostId envelope (BR-1).
@@ -1498,7 +1510,9 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
         const recovery = `${reconcile} If retrying, repeat the same create with --id ${shellQuote(qitemId)} and unchanged source, destination, body and options. A missing row does not rule out a pending commit; retrying without this ID creates new work.`;
         // stderr survives an interrupted wait without adding a second JSON
         // document to stdout. This is a request identity, NOT a commit receipt.
-        console.error(`Queue create request ID: ${qitemId} (not proof of persistence). ${recovery}`);
+        // --id-only keeps only the ID here, and gives the recovery guidance if the outcome turns out unknown.
+        const requestNotice = `Queue create request ID: ${qitemId} (not proof of persistence). ${recovery}`;
+        console.error(idOnly ? `Request ID (unconfirmed): ${qitemId}` : requestNotice);
         const receipt = writeReceipt(opts.full, {
           verb: "create", nudgeSuppressed: opts.nudge === false, idGiven: opts.id !== undefined, remoteHost: remoteHostOf(hostResolved.hostId),
         });
@@ -1573,6 +1587,21 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
         };
         // Every create that's answered with a row ends here: its warning, --verify's delivery, and the output.
         const finish = async (created: Record<string, unknown>, status: number, recovered?: "neutral" | "remote") => {
+          // --id-only: only a reply naming this request's ID confirms it. Any other 2xx is read back once by that ID, as a
+          // lost answer is; a row read back always names it.
+          if (idOnly && status < 400 && created?.qitemId !== qitemId) {
+            const named = typeof created?.qitemId === "string" ? `named ${created.qitemId}` : "named no row";
+            console.error(`The daemon answered ${status} but ${named}, not ${qitemId}.`);
+            const late = await readBackCreate(deps, client, hostResolved.hostId, qitemId, sent);
+            console.error(late.note);
+            if (late.row) {
+              await finish(late.row, 200, late.remoteConfirmed ? "remote" : "neutral");
+              return;
+            }
+            console.error(requestNotice);
+            process.exitCode = 1;
+            return;
+          }
           if (status < 400) {
             if (recovered) emitRecoveredScopeAdvisory(recovered === "remote");
             else emitScopeAdvisories(created);
@@ -1604,6 +1633,19 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           for (const advisory of advisories) {
             if (status < 400 && advisory.code === "shared_channel_correspondence" && typeof advisory.message === "string") console.error(`Warning: ${advisory.message}`);
           }
+          // --id-only: stdout carries the confirmed row's ID and nothing else; a refusal and --verify's receipt go to stderr.
+          if (idOnly) {
+            if (status >= 400) {
+              printResult(false, created, status, console.error);
+              return;
+            }
+            if (opts.verify) {
+              const delivery = await waitForDeliveryOutcome(createReceiptReader(deps, client, hostResolved.hostId, qitemId, sent), qitemId, deps.deliveryVerify, { destinationSession: hostResolved.destination, nudge: opts.nudge });
+              console.error(`Delivery: ${delivery.outcome}.${delivery.detail ? ` ${delivery.detail}` : ""}${delivery.nextAction ? ` Next: ${delivery.nextAction}` : ""}`);
+            }
+            console.log(qitemId);
+            return;
+          }
           if (opts.verify && status < 400) {
             const createdId = typeof created.qitemId === "string" ? created.qitemId : null;
             const delivery = createdId
@@ -1632,7 +1674,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
             // Keep the shared typed error/exit path, including --json, while
             // supplying the identity missing from an unreadable/late response.
             res.message += ` ${recovery}`;
-          }
+          } else if (idOnly) console.error(requestNotice);
           throw res;
         }
         if (res.status >= 400 && res.data?.outcome === "indeterminate") {
@@ -1645,7 +1687,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
             return;
           }
           // Preserve that failure and expose the same recovery ID.
-          printResult(opts.json ?? false, { ...res.data, qitemId, recovery }, res.status);
+          printResult(opts.json ?? false, { ...res.data, qitemId, recovery }, res.status, idOnly ? console.error : console.log);
           return;
         }
         const refusal = res.status >= 400 ? provenCreateRefusal(res.status, res.data) : null;

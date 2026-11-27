@@ -23,6 +23,8 @@ describe.skipIf(!fs.existsSync(cliEntry))("a busy but alive daemon gets the real
   let port: number;
   let healthz: Healthz = "ok";
   let emitHangs = false;
+  let createHangs = false;
+  let onCreate: (() => void) | null = null;
   const requests: string[] = [];
   const held = new Set<http.ServerResponse>();
   let home: string;
@@ -44,13 +46,18 @@ describe.skipIf(!fs.existsSync(cliEntry))("a busy but alive daemon gets the real
         return;
       }
       requests.push(`${req.method} ${url.split("?")[0]}`);
-      req.resume();
+      let raw = "";
+      req.on("data", (c) => { raw += String(c); });
       req.on("end", () => {
         if (url.startsWith("/api/stream/emit")) {
           if (emitHangs) { held.add(res); return; }
           return void res.writeHead(201, { "Content-Type": "application/json" }).end(JSON.stringify({ streamItemId: "s-1" }));
         }
         if (url.startsWith("/api/queue/create")) {
+          if (createHangs) { held.add(res); onCreate?.(); return; }
+          if (raw.includes('"qitemId"')) {
+            return void res.writeHead(201, { "Content-Type": "application/json" }).end(JSON.stringify({ qitemId: JSON.parse(raw).qitemId, state: "pending" }));
+          }
           return void res.writeHead(201, { "Content-Type": "application/json" }).end(JSON.stringify({ qitemId: "qitem-20261021000000-aaaa", state: "pending" }));
         }
         res.writeHead(200, { "Content-Type": "application/json" }).end("[]");
@@ -70,9 +77,11 @@ describe.skipIf(!fs.existsSync(cliEntry))("a busy but alive daemon gets the real
     requests.length = 0;
     healthz = "ok";
     emitHangs = false;
+    createHangs = false;
+    onCreate = null;
   });
 
-  async function rig(args: string[], env: NodeJS.ProcessEnv = {}): Promise<Run> {
+  async function rig(args: string[], env: NodeJS.ProcessEnv = {}, killOnCreate = false): Promise<Run> {
     const childEnv: NodeJS.ProcessEnv = { ...process.env, OPENRIG_HOME: home, OPENRIG_URL: `http://127.0.0.1:${port}`, ...env };
     for (const key of ["RIGGED_HOME", "RIGGED_URL", "OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME"]) if (!(key in env)) delete childEnv[key];
     for (const [key, value] of Object.entries(env)) if (value === undefined) delete childEnv[key];
@@ -81,6 +90,7 @@ describe.skipIf(!fs.existsSync(cliEntry))("a busy but alive daemon gets the real
     let stderr = "";
     child.stdout.on("data", (c) => { stdout += String(c); });
     child.stderr.on("data", (c) => { stderr += String(c); });
+    if (killOnCreate) onCreate = () => child.kill("SIGKILL");
     const exit = await new Promise<number | null>((resolve) => child.on("close", (code) => resolve(code)));
     const run = { stdout, stderr, exit, requests: [...requests] };
     console.log(`busy-daemon [${args.slice(0, 2).join(" ")} healthz=${healthz}] ${JSON.stringify(run)}`);
@@ -134,6 +144,24 @@ describe.skipIf(!fs.existsSync(cliEntry))("a busy but alive daemon gets the real
     const r = await rig(["queue", "create", "--destination", "worker@build", "--body", "b", "--summary", "s", "--json"], { OPENRIG_SESSION_NAME: "lead@build" });
     expect(r.requests).toEqual(["POST /api/queue/create"]);
     expect(r.exit).toBe(0);
+  }, 30_000);
+
+  it("a queue create --id-only prints only the confirmed ID on stdout", async () => {
+    const r = await rig(["queue", "create", "--destination", "worker@build", "--body", "b", "--summary", "s", "--id-only"], { OPENRIG_SESSION_NAME: "lead@build" });
+    const sent = /^Request ID \(unconfirmed\): (qitem-\d{14}-[0-9a-f]{16})$/m.exec(r.stderr);
+    expect(sent).not.toBeNull();
+    expect(r.stdout).toBe(`${sent![1]}\n`);
+    expect(r.requests).toEqual(["POST /api/queue/create"]);
+    expect(r.exit).toBe(0);
+  }, 30_000);
+
+  it("a queue create --id-only killed after its request was sent has already left the request ID on stderr", async () => {
+    createHangs = true;
+    const r = await rig(["queue", "create", "--destination", "worker@build", "--body", "b", "--summary", "s", "--id-only"], { OPENRIG_SESSION_NAME: "lead@build" }, true);
+    expect(r.requests).toEqual(["POST /api/queue/create"]);
+    expect(r.exit).toBeNull();
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/^Request ID \(unconfirmed\): qitem-\d{14}-[0-9a-f]{16}$/m);
   }, 30_000);
 
   it("a recorded daemon whose process is alive but whose /healthz fails gets the real request", async () => {
