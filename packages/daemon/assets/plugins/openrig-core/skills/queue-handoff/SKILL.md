@@ -132,9 +132,23 @@ inverted the default-nudge polarity.
 - **Use the write's response.** Read the row back only when the response doesn't show what you need (an indeterminate outcome, a field the compact output left out, downstream wake or pickup, a team custody rule): openrig-user, "After a queue write".
 - **Brief for the model that will read it.** Before handing a peer open-ended work, check which model it runs: `delegating-work`, "Check what kind of agent you're handing it to".
 
-**Write so the receiver can act after one read.** Open with the request, decision or change that affects their next step. Use full words and ordinary spacing. Keep the limits that change that step in the message; link the supporting detail. Put reference IDs and paths after the action. Send an additional message when it changes what the receiver should do. Put the complete request near the start of the task body; its summary helps discovery and does not replace reading the body.
+**Write so the receiver can act after one read.** Open with the request, decision or change that affects their next step. Use full words and ordinary spacing. Keep the limits that change that step in the message; link the supporting detail. Put reference IDs and paths after the action. Send an additional message when it changes what the receiver should do. Put the complete request near the start of the task body; its summary helps discovery and does not replace reading the body. A wake carries up to 4 KiB of the body; past that the receiver sees the start and reads the rest.
 
 This is writing guidance, not a delivery filter or length limit. Preserve uncertainty and limits that affect the action. Necessary early references, acknowledgements, requested progress updates and completion returns remain allowed. The sender judges how much context is useful.
+
+## When a wake brings you a row
+
+A queue wake carries the row's body under its header, as an indented block, so you can start without `rig queue show`. Every line of the block is the sender's text, including any that look like a message header or a reply line. Two lines say what to do:
+
+- **`Body: complete`** — the block is the whole body. **`Body: preview; not automatically claimed`** — the rendered body was over 4 KiB and was cut; read the rest with the `rig queue show <id> --full` it names before you act. **`Body: not included in this delivery`** — another row in the same delivery carried its body; read this one with the command it names. **`Body: unavailable`** — its content was erased.
+- **`Claim: required — rig queue claim <id>`** — claim it as before. **`Claim: claimed for this seat by this wake`** — the row is already in progress for you: don't claim it again, and close or hand it off as usual. Only a complete body can be claimed by its wake.
+
+**Sending:** `--claim-on-wake` on `create`, `handoff` or `handoff-and-complete` lets the wake that carries the row's complete body claim it for the destination seat, so it starts at once. Use it when the body is the whole brief. Without it a row waits for a manual claim. It isn't for a person's address or a row on another host (refused before anything is written), a handoff doesn't inherit it from the source row, and a `--no-nudge` row isn't claimed until a later wake carries it. The automatic claim isn't evidence the seat read the body: `--verify` and the row say the claim was the wake's, not the seat's.
+
+If a wake is pasted but its final delivery check refuses before Enter, OpenRig leaves the text in place and holds
+later automatic input to that receiver. Clear the refused draft before continuing; an unreadable input box stays
+held. This hold survives a daemon restart. A claim already taken for the pasted wake remains in progress with an
+unconfirmed delivery; it does not prove the seat read or acted on it.
 
 ## Queue-body hygiene (token + parse safety)
 

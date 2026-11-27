@@ -408,6 +408,13 @@ your context, your compaction and your replacement — and it is the only thing 
   everything. Since 0.7.18 `rig queue tag <id> --add <tag>` adds tags to a row that already
   exists, in any state, without changing its state, claim or closure; an added `project:`,
   `mission:` or `slice:` tag reaches the scope views like a create-time tag.
+  A seat's wake carries the row's body, up to 4 KiB rendered, so it can start without
+  `rig queue show`; a longer body arrives as a marked preview with the command that reads the rest.
+  `--claim-on-wake` (on `create`, `handoff` and `handoff-and-complete`) lets the wake that carries
+  the complete body claim the row for its seat; without it the row waits for a manual claim. It's
+  refused for a person's address or another host before anything is written, and `--verify` says
+  when a claim was the wake's, not the seat's. `create --id-only` (or `--quiet`) prints only the
+  confirmed row's ID, for scripts.
 - **`rig queue show`** — what a row *actually says*. The header is not the body. On a closed row,
   `--full` adds `closingTransition`: how it ended, who closed it and the closing note.
   `rig queue show`, `list`, `transitions`, `update` and `block` take `--host <id>` for a row on

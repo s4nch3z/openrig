@@ -62,6 +62,12 @@ purpose-built, corruption-safe surface (it kills the backtick-shell-corruption c
 bodies). Do NOT inline a backtick-heavy or multi-line body via `--body`: `rig queue create` body
 parsing breaks on unescaped backticks and rejects flag-like tokens.
 
+The destination seat's wake carries the body, up to 4 KiB rendered (past that, the start and the command that reads
+the rest), so the seat can start without a `rig queue show`. `--claim-on-wake` (also on `handoff` and
+`handoff-and-complete`) lets the wake that carries the complete body claim the row for that seat; without it the row
+waits for a manual claim. Not for a person's address or another host: both are refused before anything is written.
+`queue-handoff`, "When a wake brings you a row", says what the receiving seat sees.
+
 Example:
 
 ```bash
@@ -108,9 +114,20 @@ failure into success.
 
 `create` also prints `Queue create request ID: <id> (not proof of persistence)` on stderr *before* it sends the write,
 so an interrupted create can be reconciled. That ID names a request, not a row. The row is the `qitemId` on stdout
-when the command exits 0. A non-zero exit means no row was confirmed, even when stdout carries a `qitemId`: an
-indeterminate answer repeats the request ID so you can reconcile by it. Don't merge stderr into stdout and keep the
-first `qitem-…` you find there; a refused create prints its request ID first, too.
+when the command exits 0. A non-zero exit can mean the outcome is unknown or a confirmed row did not retain a
+requested policy; read the diagnostic before retrying. An indeterminate answer repeats the request ID so you can
+reconcile by it. Don't merge stderr into stdout and keep the first `qitem-…` you find there; a refused create prints its request ID first, too.
+
+For a script that needs only the row's ID, `create --id-only` (or `--quiet`) prints exactly that ID and a newline on
+stdout, and only once the daemon's answer names this request's own row. Before sending, stderr gets one short
+`Request ID (unconfirmed): <id>` line, so an interrupted create can still be reconciled by it. Empty stdout never
+proves nothing was written: on an unknown outcome stderr gives the full recovery guidance and the command exits
+non-zero. Warnings, refusals and `--verify`'s delivery receipt go to stderr; an unresolved delivery leaves the exit 0
+and the ID on stdout, since the row exists. It can't be combined with `--json` or `--full` (refused before sending).
+A same-ID retry that changes `--claim-on-wake` is refused with 409 `qitem_claim_on_wake_conflict` and the stored
+policy; the original row is left as it was. If an older endpoint saves the row but drops the requested policy,
+`claim_on_wake_not_kept` exits non-zero with no ID-only stdout, names the saved row and warns not to create another.
+Reconcile that same ID; an exit code alone does not prove the write failed.
 
 A timed-out write can still land late. To retry a `create` or `rig stream emit` safely, repeat it unchanged with the
 same `--id` (create's request ID, or the emit's own), since the daemon keeps one row or item per ID; an emit sent
