@@ -1372,7 +1372,8 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .option("--claim-on-wake", "Let the wake that carries this row's complete body claim it for the destination seat, so that seat needn't run rig queue claim. Without it the row waits for a manual claim, as before. A body over the wake's 4 KiB arrives as a preview and isn't claimed; with --no-nudge the row is claimed only when a later wake carries it. Not for a person's address or another host")
     .addHelpText("after", `
 A seat's wake carries the row's body (up to 4 KiB rendered; a longer one arrives as a preview with the command that
-reads the rest), so the seat can start without rig queue show. Without --claim-on-wake it claims the row itself:
+reads the rest), so the seat can start without rig queue show.
+Without --claim-on-wake the receiving seat claims the row manually:
   rig queue create --destination dev-impl@team --summary "Fix the import dedupe" --body-file brief.md
   rig queue create --destination dev-impl@team --summary "Fix the import dedupe" --body-file brief.md --claim-on-wake
 For a script, --id-only prints only the confirmed ID. Empty stdout doesn't prove nothing was written: when stderr says
