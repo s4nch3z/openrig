@@ -146,6 +146,24 @@ describe("QA: queue create --id-only (compiled CLI, stub daemon)", () => {
     }, 60_000);
   }
 
+  it("a changed claim policy on the same ID: 409 conflict, no success stdout, the stored policy is named", async () => {
+    mode = "conflict";
+    const r = await create(["--id-only", "--claim-on-wake", "--id", "qitem-20261126000000-00000000000000aa"]);
+    expect(r.exit).not.toBe(0);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain("qitem-20261126000000-00000000000000aa");
+    expect(r.stderr).toMatch(/claim[_ -]on[_ -]wake/i);
+  }, 30_000);
+
+  it("an older endpoint that drops a requested claim-on-wake: known persisted, same ID, exit 1, no success stdout", async () => {
+    mode = "ignores-policy";
+    const r = await create(["--id-only", "--claim-on-wake"]);
+    expect(r.posted).toHaveLength(1);
+    expect(r.exit).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain(String(r.posted[0]!.qitemId));
+  }, 30_000);
+
   it("default output is unchanged: the existing pre-send request notice still prints", async () => {
     const r = await create([]);
     expect(r.exit).toBe(0);

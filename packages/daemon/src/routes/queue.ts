@@ -418,6 +418,14 @@ export function queueRoutes(): Hono {
     return null;
   }
 
+  /** Claim on wake is local in this version: a write for another host's daemon that opts in is refused before it is
+   *  forwarded or its source row is closed, so the opt-in is never silently dropped by a daemon that doesn't know it. */
+  function crossHostClaimOnWakeRefusal(c: { json: (body: unknown, status?: number) => Response }, claimOnWake: unknown): Response | null {
+    if (claimOnWake === undefined || claimOnWake === false) return null;
+    return c.json({ error: "claim_on_wake_cross_host_unsupported",
+      message: "claimOnWake is supported only for a row on this daemon; a write for another host was refused before it was forwarded, and nothing was created or closed. Leave claimOnWake off for a cross-host write." }, 400);
+  }
+
   function errorResponse(c: { json: (body: unknown, status?: number) => Response }, err: unknown): Response {
     if (err instanceof QueueRepositoryError) {
       const status = err.code === "qitem_not_found" ? 404
@@ -442,6 +450,11 @@ export function queueRoutes(): Hono {
         // caller id-reuse (a bug, not an idempotent retry) — surface as a
         // conflict, never overwrite.
         : err.code === "qitem_id_reuse" ? 409
+        // Claim on wake: a same-id retry that changes it, and an opt-in no seat could act on.
+        : err.code === "qitem_claim_on_wake_conflict" ? 409
+        : err.code === "invalid_claim_on_wake" ? 400
+        : err.code === "claim_on_wake_unsupported_destination" ? 400
+        : err.code === "claim_on_wake_unavailable" ? 400
         // Queue erasure deleted this id's row; it isn't created again.
         : err.code === "qitem_erased" ? 409
         // OPR.0.4.6.MH3 FR-4 (C2): a cross-host source-close re-drive naming a
@@ -654,11 +667,13 @@ export function queueRoutes(): Hono {
       /** How the sender's identity was established, recorded on the source close as a local handoff records it. */
       identityProvenance?: string | null;
       humanAlert?: boolean;
+      claimOnWake?: boolean;
     },
     createSuccessor: (forwardBody: Record<string, unknown>) => Promise<{ ok: true; payload: unknown } | { ok: false; response: Response }> =
       (forwardBody) => forwardQueueWrite(c, hostId, "/api/queue/create", forwardBody),
     delivery: "forwarded" | "in-process" = "forwarded",
   ): Promise<Response> {
+    { const refused = crossHostClaimOnWakeRefusal(c, body.claimOnWake); if (refused) return refused; }
     const repo = getRepo(c);
     const source = repo.getById(qitemId);
     if (!source) return c.json({ error: "qitem_not_found", message: `qitem ${qitemId} not found` }, 404);
@@ -861,6 +876,8 @@ export function queueRoutes(): Hono {
       returnRoute?: string;
       /** How a route carried from another host was established there. */
       returnRouteBasis?: string;
+      /** Opt in to a claim by the wake that carries the complete body (default false). */
+      claimOnWake?: boolean;
     }>().catch(() => ({} as never));
 
     // The return route, when the caller asks for one: `auto` issues a conversation address for this create (from its id, so
@@ -923,6 +940,7 @@ export function queueRoutes(): Hono {
     // before the first forward (Q-a) so every retry carries the same id. No
     // local row is ever written on the cross-host path.
     if (typeof body.hostId === "string" && !resolvesToLocalHost(body.hostId, getSelfHostId())) {
+      { const refused = crossHostClaimOnWakeRefusal(c, body.claimOnWake); if (refused) return refused; }
       if (body.classificationBinding !== undefined)
         return c.json({ error: "invalid_classification_binding", message: "Classifier-bound effects belong to this daemon's local queue." }, 400);
       const mintedId = createId ?? newQitemId();
@@ -990,6 +1008,7 @@ export function queueRoutes(): Hono {
         nudge: (body as { nudge?: boolean }).nudge,
         ...resolveRecordedIdentity(c, identity), // P21 §4 era-stamp, plus the MCP adapter's caller on a direct attributed request (principal:v1)
         ...(route ? { returnRoute: route.address, returnRouteBasis: route.basis } : {}),
+        claimOnWake: body.claimOnWake,
       });
       const scopeAdvisory = !(body.tags ?? []).includes(CROSS_HOST_TAG) ? createScopeAdvisory(c, item.tags) : null;
       const advisories = [destinationAdvisory(c, item.destinationSession), sharedChannelAskAdvisory(item.destinationSession, body.humanIntent), scopeAdvisory,
@@ -1269,6 +1288,8 @@ export function queueRoutes(): Hono {
       // OPR.0.4.6.MH3 FR-1: the out-of-band host envelope (BR-1). Absent /
       // "" / "local" = today's local transactional path, byte-identical.
       hostId?: string;
+      /** As on create, for the new row only. */
+      claimOnWake?: boolean;
     }>().catch(() => ({} as never));
     // P21 I3: the handoff actor is the transport header, never body.fromSession.
     const identity = requireSenderIdentity(c, { verb: "queue handoff", bodyClaim: body.fromSession });
@@ -1301,6 +1322,7 @@ export function queueRoutes(): Hono {
       humanAlert: body.humanAlert,
       // The source close is request-authored, so it carries the same stamp the local path records.
       identityProvenance: resolveRecordedProvenance(c, identity),
+      ...(body.claimOnWake !== undefined ? { claimOnWake: body.claimOnWake } : {}),
     };
     if (typeof body.hostId === "string" && !resolvesToLocalHost(body.hostId, getSelfHostId())) {
       return crossHostHandoff(c, qitemId, body.hostId, "handed-off", crossHostBody);
@@ -1327,6 +1349,7 @@ export function queueRoutes(): Hono {
         nudge: (body as { nudge?: boolean }).nudge,
         humanAlert: body.humanAlert,
         ...resolveRecordedIdentity(c, identity), // P21 §4 era-stamp, plus the MCP adapter's caller on a direct attributed request (principal:v1)
+        claimOnWake: body.claimOnWake,
       });
       const destination = destinationAdvisory(c, result.created.destinationSession);
       const scopeCheckRequested = c.req.header(CLI_HANDOFF_SCOPE_ADVISORY_HEADER) === "1";
@@ -1365,6 +1388,8 @@ export function queueRoutes(): Hono {
       humanAlert?: boolean;
       // OPR.0.4.6.MH3 FR-1: the out-of-band host envelope (BR-1).
       hostId?: string;
+      /** As on create, for the new row only. */
+      claimOnWake?: boolean;
     }>().catch(() => ({} as never));
     // P21 I3: the handoff-and-complete actor is the transport header, never body.fromSession.
     const identity = requireSenderIdentity(c, { verb: "queue handoff-and-complete", bodyClaim: body.fromSession });
@@ -1395,6 +1420,7 @@ export function queueRoutes(): Hono {
       humanAlert: body.humanAlert,
       // The source close is request-authored, so it carries the same stamp the local path records.
       identityProvenance: resolveRecordedProvenance(c, identity),
+      ...(body.claimOnWake !== undefined ? { claimOnWake: body.claimOnWake } : {}),
     };
     if (typeof body.hostId === "string" && !resolvesToLocalHost(body.hostId, getSelfHostId())) {
       return crossHostHandoff(c, qitemId, body.hostId, "done", crossHostBody);
@@ -1421,6 +1447,7 @@ export function queueRoutes(): Hono {
         nudge: body.nudge,
         humanAlert: body.humanAlert,
         identityProvenance: resolveRecordedProvenance(c, identity), // P21 §4 era-stamp: transport:v1 if the header named the actor here, else claimed:v1 (resolveRecordedProvenance degrades)
+        claimOnWake: body.claimOnWake,
       });
       const destination = destinationAdvisory(c, result.created.destinationSession);
       const scopeCheckRequested = c.req.header(CLI_HANDOFF_SCOPE_ADVISORY_HEADER) === "1";

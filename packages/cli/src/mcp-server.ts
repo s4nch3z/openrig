@@ -51,6 +51,20 @@ function errorResult(text: string, code: string, message: string, extra: Record<
   return { content: [{ type: "text", text }], isError: true, structuredContent: { ok: false, code, message, ...extra } };
 }
 
+/** A write that asked for claimOnWake, answered by a daemon that didn't keep it (an older one): the item is saved and waits
+ *  for a manual claim. An error naming the saved item, so it isn't written again. */
+function claimOnWakeNotKept(qitemId: string | null, saved: string): TextResult {
+  const message = `${saved}${qitemId ? ` ${qitemId}` : ""} was saved, but the daemon didn't keep claimOnWake (an older daemon?), so it waits for a manual claim. Don't repeat the write.`;
+  return errorResult(message, "claim_on_wake_not_kept", message, qitemId ? { qitemId } : {});
+}
+
+/** claimOnWake with a host: it's kept only for an item on this daemon, so the write is refused before it's sent, as the
+ *  daemon refuses a write it would forward. */
+function claimOnWakeCrossHost(): TextResult {
+  const message = "claimOnWake is supported only for an item on this daemon; a write for another host was refused before it was sent, and nothing was created or handed off. Leave claimOnWake off for a write to another host.";
+  return errorResult(message, "claim_on_wake_cross_host_unsupported", message);
+}
+
 /** A request that threw (the daemon unreachable, a timeout): its message as the text, as before, with a code. */
 function caught(err: unknown): TextResult {
   const message = (err as Error).message;
@@ -1814,11 +1828,13 @@ export function createMcpServer(client: DaemonClient, options: { seat?: string; 
         revises: z.string().optional().describe("The qitemId of the work this asks to revise"),
         alert: z.boolean().optional().describe("For an ask to a person that's urgent: something only they can do, or an approval whose wait costs now (as rig queue create --alert). It stands out in Slack. Without it the ask still posts to Slack unless the person's Slack subscription is urgent-only, in which case it waits on Steering and the TUI"),
         host: z.string().min(1).optional().describe("Act on a REGISTERED remote host's daemon instead of this one (rig host list shows the hosts; as --host on the matching rig verb); a write there names this server's seat (rig_whoami) as its sender, as a local write does"),
+        claimOnWake: z.boolean().optional().describe("Let the wake that carries the item's complete body claim it for the destination seat (as rig queue create --claim-on-wake); without it the item waits for a manual claim. Not for a person's address or another host"),
       }),
     },
-    async ({ destination, body, summary, tags, priority, tier, qitemId, revises, alert, host }) => {
+    async ({ destination, body, summary, tags, priority, tier, qitemId, revises, alert, host, claimOnWake }) => {
       const target = hostTarget(host);
       if ("content" in target) return target;
+      if (claimOnWake && target.remote) return claimOnWakeCrossHost();
       // The server's one receiver counts for this connection only when its grant reaches it. Then a refused destination
       // says how to reach it, so the assistant retries instead of telling the person the connection lacks access. It
       // never names the receiver.
@@ -1923,7 +1939,9 @@ export function createMcpServer(client: DaemonClient, options: { seat?: string; 
           tags: access?.external ? tags?.filter((tag) => !OPENRIG_PROVENANCE_TAG.test(tag)) : tags,
           ...(alert ? { humanAlert: true } : {}),
           ...(lineage ? { chainOfRecord: lineage.chainOfRecord } : {}),
+          ...(claimOnWake ? { claimOnWake: true } : {}),
         });
+        if (claimOnWake && res.status < 400 && (res.data as { claimOnWake?: unknown } | null)?.claimOnWake !== true) return claimOnWakeNotKept(id, "The item");
         // An external caller reusing the id of an item it can't see learns only that the id is taken, never that item's
         // parties.
         const conflict = (res.data ?? {}) as { error?: unknown; existingSource?: unknown; existingDestination?: unknown };
@@ -2867,12 +2885,14 @@ export function createMcpServer(client: DaemonClient, options: { seat?: string; 
         priority: z.string().optional().describe("Priority for the new item (default: the item's own)"),
         evidenceRef: z.string().optional().describe("Pointer to the durable artifact, which a new item for a person needs"),
         host: z.string().min(1).optional().describe("Act on a REGISTERED remote host's daemon instead of this one (rig host list shows the hosts; as --host on the matching rig verb); a write there names this server's seat (rig_whoami) as its sender, as a local write does"),
+        claimOnWake: z.boolean().optional().describe("As on rig_queue_create, for the new item; not inherited from this one"),
       }),
       annotations: DESTRUCTIVE,
     },
-    async ({ qitemId, to, body, note, summary, tags, priority, evidenceRef, host }) => {
+    async ({ qitemId, to, body, note, summary, tags, priority, evidenceRef, host, claimOnWake }) => {
       const target = hostTarget(host);
       if ("content" in target) return target;
+      if (claimOnWake && target.remote) return claimOnWakeCrossHost();
       if (scope && !scope.session(to)) return outOfScope(`Destination ${to}`);
       try {
         const denied = await itemOutOfScope(qitemId, "owner");
@@ -2881,9 +2901,15 @@ export function createMcpServer(client: DaemonClient, options: { seat?: string; 
         return caught(err);
       }
       try {
-        return mapResult(await withRequestsAdvisory(await hostPost(target, `/api/queue/${encodeURIComponent(qitemId)}/handoff`, {
+        const res = await hostPost(target, `/api/queue/${encodeURIComponent(qitemId)}/handoff`, {
           toSession: to, body, transitionNote: note, summary, tags, priority, evidenceRef,
-        }), to, target.remote), undefined, { structured: true });
+          ...(claimOnWake ? { claimOnWake: true } : {}),
+        });
+        const created = (res.data as { created?: { qitemId?: unknown; claimOnWake?: unknown } } | null)?.created;
+        if (claimOnWake && res.status < 400 && created?.claimOnWake !== true) {
+          return claimOnWakeNotKept(typeof created?.qitemId === "string" ? created.qitemId : null, `${qitemId} was handed off, and its new item`);
+        }
+        return mapResult(await withRequestsAdvisory(res, to, target.remote), undefined, { structured: true });
       } catch (err) {
         const failure = caught(err);
         const text = `${(err as Error).message} The outcome is unknown: check rig_queue_show with qitemId ${qitemId}${target.remote && target.name ? ` and host ${target.name}` : ""} before retrying. If it reads handed off, its successor is the new item, so don't hand it off again.`;

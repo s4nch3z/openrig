@@ -345,6 +345,8 @@ export interface QueueItem {
    *  which its handoffs carry and its new escalations deliver to, and how it was established. */
   returnRoute?: string;
   returnRouteBasis?: string | null;
+  /** Present only on a row that opted in (`--claim-on-wake`): the wake that carries its complete body claims it. */
+  claimOnWake?: true;
   /** Present only on compact list rows, which omit these fields entirely so omitted content
    *  can't be mistaken for an empty value. Full reads never carry this marker. */
   fieldsElided?: Array<(typeof COMPACT_ELIDED_FIELDS)[number]>;
@@ -413,6 +415,7 @@ interface QueueItemRow {
   target_repo: string | null;
   return_route?: string | null;
   return_route_basis?: string | null;
+  claim_on_wake?: number | null;
 }
 
 /**
@@ -525,6 +528,9 @@ export interface QueueCreateInput {
    *  and how it was established. A cancel-and-replace successor (handedOffFrom) without one keeps the original's. */
   returnRoute?: string | null;
   returnRouteBasis?: string | null;
+  /** Opt in to a claim by the wake that carries the row's complete body. Default false: the row waits for a manual claim.
+   *  Refused for a person's destination, which has no seat to claim it; a same-id retry can't change it. */
+  claimOnWake?: boolean;
 }
 
 /** Tags to add to an existing row (`addTags`). */
@@ -639,6 +645,8 @@ export interface QueueHandoffInput {
   identityPrincipal?: string | null;
   /** As on create: a handoff to a person lands on Steering, and true also sends one Slack alert. */
   humanAlert?: boolean;
+  /** As on create, for the new row only: it isn't inherited from the handed-off row. */
+  claimOnWake?: boolean;
 }
 
 /**
@@ -1250,6 +1258,7 @@ export class QueueRepository {
   private readonly hasHumanIntentColumn: boolean;
   private readonly hasReplyToColumn: boolean;
   private readonly hasReturnRouteColumn: boolean;
+  private readonly hasClaimOnWakeColumn: boolean;
   private readonly hasHumanQuestionsColumn: boolean;
   private readonly hasDelegatedDecisionColumn: boolean;
   private readonly hasEvidenceRefColumn: boolean;
@@ -1361,6 +1370,7 @@ export class QueueRepository {
     this.hasHumanIntentColumn = detectQueueColumn(db, "human_intent");
     this.hasReplyToColumn = detectQueueColumn(db, "reply_to");
     this.hasReturnRouteColumn = detectQueueColumn(db, "return_route");
+    this.hasClaimOnWakeColumn = detectQueueColumn(db, "claim_on_wake");
     this.hasHumanQuestionsColumn = detectQueueColumn(db, "human_questions");
     this.hasDelegatedDecisionColumn = detectQueueColumn(db, "delegated_decision");
     this.hasEvidenceRefColumn = detectQueueColumn(db, "evidence_ref");
@@ -2961,6 +2971,12 @@ export class QueueRepository {
             existing.destinationSession === input.destinationSession &&
             existing.sourceSession === input.sourceSession
           ) {
+            // A retry can't change how the row is claimed: its wake may already be staged under the stored policy.
+            if ((input.claimOnWake === true) !== (existing.claimOnWake === true)) {
+              throw new QueueRepositoryError("qitem_claim_on_wake_conflict",
+                `qitem ${input.qitemId} already exists with claimOnWake ${existing.claimOnWake === true}; a retry can't change it to ${input.claimOnWake === true}.`,
+                { qitemId: input.qitemId, storedClaimOnWake: existing.claimOnWake === true, requestedClaimOnWake: input.claimOnWake === true });
+            }
             // Keep retry compatibility, but never imply that an absorbed,
             // different body was saved. Decide at the actual PK conflict,
             // rather than comparing a fresh create's post-nudge readback.
@@ -3094,6 +3110,7 @@ export class QueueRepository {
       humanQuestions = parsed.questions;
     }
     this.assertHumanAlert(input.humanAlert, input.destinationSession, input.humanIntent);
+    this.assertClaimOnWake(input.claimOnWake, input.destinationSession);
     const id = input.qitemId ?? newQitemId();
     // A row queue erasure deleted keeps only its id: a create that reuses it would bring erased work back.
     if (input.qitemId && this.hasErasedIdsTable
@@ -3148,6 +3165,7 @@ export class QueueRepository {
     this.persistReturnRoute(id, input.returnRoute ?? replaced?.returnRoute ?? null,
       input.returnRoute ? input.returnRouteBasis ?? null : replaced?.returnRouteBasis ?? null);
     this.persistMintingGeneration(id, input.sourceSession);
+    this.persistClaimOnWake(id, input.claimOnWake);
     const notification = this.classifyOwnerNotification({
       action: "create",
       humanIntent: input.humanIntent,
@@ -3176,6 +3194,22 @@ export class QueueRepository {
       summary: input.summary ?? null,
     });
     return { qitemId: id, persistedEvent };
+  }
+
+  /** Claim on wake needs a seat that a wake reaches and that can claim: a person's destination (by address or by the
+   *  registry) has none, and a schema without the column couldn't keep the opt-in. Refused before anything is written. */
+  private assertClaimOnWake(claimOnWake: unknown, destination: string): void {
+    if (claimOnWake === undefined || claimOnWake === false) return;
+    if (claimOnWake !== true) throw new QueueRepositoryError("invalid_claim_on_wake", "claimOnWake must be true, false or omitted.");
+    if (this.isPersonAddress(destination)) {
+      throw new QueueRepositoryError("claim_on_wake_unsupported_destination",
+        `claimOnWake needs a seat a wake can reach; ${destination} is a person's address, reached through the gateway, so the row would wait for a claim nobody makes. Leave claimOnWake off.`);
+    }
+    if (!this.hasClaimOnWakeColumn) throw new QueueRepositoryError("claim_on_wake_unavailable", "claimOnWake requires the current queue schema; nothing was saved.");
+  }
+
+  private persistClaimOnWake(qitemId: string, claimOnWake: boolean | undefined): void {
+    if (claimOnWake === true) this.db.prepare("UPDATE queue_items SET claim_on_wake = 1 WHERE qitem_id = ?").run(qitemId);
   }
 
   /** humanAlert marks an ask to a person: a person by address or by the registry (a registered person may be addressed as
@@ -3310,6 +3344,7 @@ export class QueueRepository {
       throw destinationValidationError("to_session", input.toSession, this.loadHumanRegistryFn);
     }
     this.assertHumanAlert(input.humanAlert, input.toSession);
+    this.assertClaimOnWake(input.claimOnWake, input.toSession);
 
     const newId = newQitemId();
     const ts = new Date().toISOString();
@@ -3392,6 +3427,7 @@ export class QueueRepository {
       // The goal's return route goes with the work, as its body does.
       this.persistReturnRoute(newId, source.returnRoute ?? null, source.returnRouteBasis ?? null);
       this.persistMintingGeneration(newId, input.fromSession);
+      this.persistClaimOnWake(newId, input.claimOnWake);
       const carried = this.carryPermissionQuestion(source, newId, input.toSession);
 
       const successorNotification = this.classifyOwnerNotification({
@@ -3498,6 +3534,7 @@ export class QueueRepository {
       throw destinationValidationError("to_session", input.toSession, this.loadHumanRegistryFn);
     }
     this.assertHumanAlert(input.humanAlert, input.toSession);
+    this.assertClaimOnWake(input.claimOnWake, input.toSession);
 
     const newId = newQitemId();
     const ts = new Date().toISOString();
@@ -3577,6 +3614,7 @@ export class QueueRepository {
       // The goal's return route goes with the work, as its body does.
       this.persistReturnRoute(newId, source.returnRoute ?? null, source.returnRouteBasis ?? null);
       this.persistMintingGeneration(newId, input.fromSession);
+      this.persistClaimOnWake(newId, input.claimOnWake);
       const carried = this.carryPermissionQuestion(source, newId, input.toSession);
 
       const successorNotification = this.classifyOwnerNotification({
@@ -7216,6 +7254,7 @@ export class QueueRepository {
       targetRepo: row.target_repo ?? null,
       ...(row.content_erased_at ? { contentErasedAt: row.content_erased_at } : {}),
       ...(row.return_route ? { returnRoute: row.return_route, returnRouteBasis: row.return_route_basis ?? null } : {}),
+      ...(row.claim_on_wake ? { claimOnWake: true as const } : {}),
     };
   }
 }

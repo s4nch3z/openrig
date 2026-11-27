@@ -34,7 +34,9 @@ function seed() {
 it("matches the migrated queue and source history column inventories", () => {
   for (const [table, columns] of Object.entries({ ...QUEUE_TRANSFER_COLUMNS,
     queue_transitions_archive: [...QUEUE_TRANSFER_COLUMNS.queue_transitions, "archived_at"] })) {
-    expect(db.prepare<[], { name: string }>(`PRAGMA table_info(${table})`).all().map(row => row.name).sort()).toEqual([...columns].sort());
+    // Claim on wake stays on its daemon, so its columns aren't transferred.
+    const local = table === "queue_items" ? ["claim_on_wake", "claim_wake_outbox_id", "claim_wake_transition_id"] : [];
+    expect(db.prepare<[], { name: string }>(`PRAGMA table_info(${table})`).all().map(row => row.name).sort()).toEqual([...columns, ...local].sort());
   }
   expect(QUEUE_TRANSFER_COLUMNS.queue_items).toHaveLength(39);
 });

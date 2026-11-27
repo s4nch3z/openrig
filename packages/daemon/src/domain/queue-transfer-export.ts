@@ -26,6 +26,8 @@ export const QUEUE_TRANSFER_COLUMNS = {
     "content_erased_at", "return_route", "return_route_basis",
     // 186: relay journal for the asking-seat's answer history
     "relayed_answers",
+    // Not 196's claim-on-wake columns: claim on wake is local to this daemon (a cross-host write refuses it), so a
+    // transferred row arrives without it and waits for a manual claim.
   ],
   // 025:17–24, 067:15, 140:15, 076:11–12. Archive base and archived_at 054:38–46; additions 082:7, 140:16, 076:13–14.
   queue_transitions: ["transition_id", "qitem_id", "ts", "state", "transition_note", "actor_session", "closure_reason",

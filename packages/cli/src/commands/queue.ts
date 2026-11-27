@@ -363,6 +363,18 @@ function queueListPage(headers: Headers | undefined): { limit: number; truncated
   return { limit: Number(limit), truncated: truncated === "1" };
 }
 
+/** A write that asked for --claim-on-wake, answered by a daemon that didn't keep it (an older one): the row is saved and
+ *  waits for a manual claim. Says so on stderr with the row's ID and sets exit 1, so there's no success output. */
+function claimOnWakeNotKept(row: unknown, json: boolean, saved: string): boolean {
+  const kept = row && typeof row === "object" ? (row as { claimOnWake?: unknown }).claimOnWake : undefined;
+  if (kept === true) return false;
+  const id = row && typeof row === "object" && typeof (row as { qitemId?: unknown }).qitemId === "string" ? (row as { qitemId: string }).qitemId : null;
+  const message = `${saved}${id ? ` ${id}` : ""} was saved, but the daemon didn't keep --claim-on-wake (an older daemon?), so it waits for a manual claim. Don't repeat the write${id ? `; rig queue show ${shellQuote(id)} --full --json shows it` : ""}.`;
+  console.error(json ? JSON.stringify({ error: "claim_on_wake_not_kept", message, ...(id ? { qitemId: id } : {}) }) : `claim_on_wake_not_kept: ${message}`);
+  process.exitCode = 1;
+  return true;
+}
+
 function printResult(json: boolean, body: unknown, status: number, print: (text: string) => void = console.log): void {
   if (isIndeterminateRemoteWrite(status, body)) {
     console.error("The write outcome is INDETERMINATE if the request may have reached a daemon — reconcile by ID before any retry.");
@@ -1351,6 +1363,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .option("--json", "JSON output for agents")
     .option("--id-only", "Print only the created row's ID on stdout, once the daemon confirms the row. Before sending, stderr gets one short line with the request's ID (not yet confirmed); full recovery guidance appears only when the outcome is unknown. Warnings and --verify's delivery receipt still go to stderr. Not with --json or --full")
     .option("--quiet", "Same as --id-only")
+    .option("--claim-on-wake", "Let the wake that carries this row's complete body claim it for the destination seat, so that seat needn't run rig queue claim. Without it the row waits for a manual claim, as before. Not for a person's address or another host")
     .action(async (opts: {
       source?: string;
       destination: string;
@@ -1381,6 +1394,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       full?: boolean;
       idOnly?: boolean;
       quiet?: boolean;
+      claimOnWake?: boolean;
     }) => {
       const idOnly = opts.idOnly === true || opts.quiet === true;
       if (idOnly && (opts.json || opts.full)) {
@@ -1535,6 +1549,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           targetRepo: opts.targetRepo,
           nudge: opts.nudge,
           ...(opts.returnRoute !== undefined ? { returnRoute: opts.returnRoute } : {}),
+          ...(opts.claimOnWake ? { claimOnWake: true } : {}),
           // OPR.0.4.6.MH3 FR-1: the out-of-band host envelope (omitted for
           // plain local writes — the local path stays byte-identical).
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
@@ -1633,6 +1648,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           for (const advisory of advisories) {
             if (status < 400 && advisory.code === "shared_channel_correspondence" && typeof advisory.message === "string") console.error(`Warning: ${advisory.message}`);
           }
+          if (status < 400 && opts.claimOnWake && claimOnWakeNotKept(created, opts.json ?? false, "Row")) return;
           // --id-only: stdout carries the confirmed row's ID and nothing else; a refusal and --verify's receipt go to stderr.
           if (idOnly) {
             if (status >= 400) {
@@ -2034,6 +2050,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: durable-artifact pointer for the new qitem. Required by the daemon when the new qitem is human-routed; optional otherwise.")
     .option("--alert", "For a handoff to a person that's urgent: something only they can do, or an approval whose wait costs now. It stands out in Slack (an interrupt with a mention). Without it the item still posts to Slack for a person on the default Slack subscription (every-ask), and waits on Steering and the TUI for one on urgent-only")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
+    .option("--claim-on-wake", "As on create, for the new qitem: the wake that carries its complete body claims it. Not inherited from the source row")
     .option("--no-nudge", "Suppress the default nudge to the new destination")
     .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
     .option("--json", "JSON output for agents")
@@ -2052,6 +2069,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       evidenceRef?: string;
       alert?: boolean;
       host?: string;
+      claimOnWake?: boolean;
       nudge?: boolean;
       json?: boolean;
       full?: boolean;
@@ -2109,12 +2127,15 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           tags,
           targetRepo: opts.targetRepo,
           nudge: opts.nudge,
+          ...(opts.claimOnWake ? { claimOnWake: true } : {}),
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
         }, handoffScopeDiagnosticOptions(hostResolved.hostId)).catch((error: unknown) => { throw withHandoffRecovery(error, qitemId, hostResolved.hostId); });
         const hint = hostSubstitutionHint(res.status, res.data, opts.to, opts.host, hostResolved);
         if (hint) console.error(hint);
         warnRouteNotCarried(res.status, res.data);
         const output = emitHandoffScopeAdvisories(res.status, res.data);
+        if (res.status < 400 && opts.claimOnWake
+          && claimOnWakeNotKept((res.data as { created?: unknown } | null)?.created, opts.json ?? false, "The handoff completed, and its new row")) return;
         await printQueueItemResult(client, qitemId, opts.json ?? false, output, res.status, writeReceipt(opts.full, {
           verb: "handoff", nudgeSuppressed: opts.nudge === false, remoteHost: remoteHostOf(hostResolved.hostId),
         }));
@@ -2141,6 +2162,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: durable-artifact pointer for the new qitem. Required by the daemon when the new qitem is human-routed; optional otherwise.")
     .option("--alert", "For a handoff to a person that's urgent: something only they can do, or an approval whose wait costs now. It stands out in Slack (an interrupt with a mention). Without it the item still posts to Slack for a person on the default Slack subscription (every-ask), and waits on Steering and the TUI for one on urgent-only")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
+    .option("--claim-on-wake", "As on create, for the new qitem: the wake that carries its complete body claims it. Not inherited from the source row")
     .option("--no-nudge", "Suppress the default nudge to the new destination")
     .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
     .option("--json", "JSON output for agents")
@@ -2159,6 +2181,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       evidenceRef?: string;
       alert?: boolean;
       host?: string;
+      claimOnWake?: boolean;
       nudge?: boolean;
       json?: boolean;
       full?: boolean;
@@ -2214,12 +2237,15 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           tags,
           targetRepo: opts.targetRepo,
           nudge: opts.nudge,
+          ...(opts.claimOnWake ? { claimOnWake: true } : {}),
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
         }, handoffScopeDiagnosticOptions(hostResolved.hostId)).catch((error: unknown) => { throw withHandoffRecovery(error, qitemId, hostResolved.hostId); });
         const hint = hostSubstitutionHint(res.status, res.data, opts.to, opts.host, hostResolved);
         if (hint) console.error(hint);
         warnRouteNotCarried(res.status, res.data);
         const output = emitHandoffScopeAdvisories(res.status, res.data);
+        if (res.status < 400 && opts.claimOnWake
+          && claimOnWakeNotKept((res.data as { created?: unknown } | null)?.created, opts.json ?? false, "The handoff completed, and its new row")) return;
         await printQueueItemResult(client, qitemId, opts.json ?? false, output, res.status, writeReceipt(opts.full, {
           verb: "handoff-and-complete", nudgeSuppressed: opts.nudge === false, remoteHost: remoteHostOf(hostResolved.hostId),
         }));
