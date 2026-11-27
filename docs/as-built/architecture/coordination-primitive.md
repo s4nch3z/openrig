@@ -146,11 +146,13 @@ replay (`a1a6ca09d`, `HookBridge.poll` / `claimedBy`). Erasure scrubs stored wak
 seat reads of a copy whose queue row is absent omit its text with
 `bodyHeld: qitem_unavailable` (`wakeCopyBodyGate`, queue and seat routes).
 
-**A refused wake paste.** (Checked against
-`b4698289cd397b42c02989df979b14e0c051c493`.) Migration
-`195_seat_input_residue` adds durable metadata records for a queue wake pasted
-before its final check refused Enter (`draft_wake_superseded`). The original
-result remains `sent: true`, `inputPhase: written`; text is left in the input.
+**A refused wake paste.** (Receiver records checked against `b4698289c`;
+refusal paths against `20a879bc3bd751c08b281eef1958124418141f2d`.) Migration
+`195_seat_input_residue` adds durable metadata records for a known queue-wake
+paste whose Enter was not sent: the wake no longer applied, the binding changed,
+another final check refused input, or the send threw before Enter. The original
+result remains written; text is left in the input. An Enter that may have been
+sent stays unconfirmed rather than being treated as a refused paste.
 The records store the node, session, pane, observed pane PID, occupant and
 outbox ID, never the body, and survive erasure of the outbox row. Receiver PIDs
 are sampled around the paste. Every distinct sample retains its own hold,
@@ -219,11 +221,14 @@ that gateway side too. For the pane side, read:
   A result no reader recognises reads `unknown`, never delivered: the wake ladder
   treats it as an unconfirmed wake, which escalates past the window without a
   re-send.
-- `lastNudgeResult`: the result as presented. It is the stored result, except
-  that a claimed row whose stored result is `delivered-ack-pending` or
-  `indeterminate:…` reads `claimed` (`presentedNudgeResult`). Unclaiming shows
-  the stored result again.
-- `claimedAt`: when the destination claimed the row. Closing doesn't clear it.
+- `lastNudgeResult`: the result as presented. A manually claimed row whose
+  stored result is `delivered-ack-pending` or `indeterminate:…` reads `claimed`
+  (`presentedNudgeResult`). A row with `claimWakeOutboxId` keeps the wire result:
+  the wake's automatic claim does not confirm delivery. Unclaiming shows the
+  stored result again.
+- `claimedAt`: when a claim was recorded for the destination. Closing doesn't
+  clear it. `claimWakeOutboxId` identifies a claim made by that wake rather than
+  a manual pickup by the seat; neither origin proves the body was read.
 - `pickup`: the derived pickup receipt (`unclaimed`, `working`, `needs-input`,
   `stalled-after-claim`, `parked`, `terminal`), computed at read time.
 
@@ -239,15 +244,15 @@ backstop and manual dispositions behave exactly as for `stalled-after-claim`.
 Queue reads, the pickup view and the execution view share this receipt
 (`queue-pickup.ts`). Unclaimed, blocked and terminal items keep their receipts.
 
-A claim isn't proof that the body was read or that the terminal render was
-verified, and closing a task isn't a new delivery receipt: a claimed task that
-is later closed still reads `claimed` when its stored result was unconfirmed
-(`delivered-ack-pending` or `indeterminate:…`); a `verified` or `failed:…`
-result reads as stored. For such an unconfirmed, claimed item,
-`rig queue create --verify` says "Terminal receipt unconfirmed, but the seat
-has claimed the item (claimed)."; for any claimed item it adds "A claim shows
-the seat took the item; it does not prove the body was read."
-(`terminalDeliveryResult`, `packages/cli/src/commands/queue.ts`).
+A manual claim isn't proof that the body was read or that the terminal render
+was verified, and closing a task isn't a new delivery receipt. The manual-claim
+shortcut still presents an unconfirmed wire result as `claimed` and tells
+`create --verify` that the seat took the item. A wake-origin claim takes no such
+shortcut: `--verify` keeps the wake's own outcome and any unresolved next action,
+and explains that the claim was the daemon's, not evidence of the seat taking or
+reading the work (`terminalDeliveryResult`, `packages/cli/src/commands/queue.ts`).
+The derived `pickup` classification may still read `working` from claim age;
+it is not additional delivery proof for a wake-origin claim.
 
 The standing detector in `queue-stuck-sweep.ts` creates findings through the
 queue repository, with `evidenceRef: rig queue show <source-qitem-id>` pointing
@@ -277,7 +282,11 @@ finding. `delivered-ack-pending`, `indeterminate:…`, missing results and unrel
 legacy human receipts do not prove resolution. Uncertainty keeps an existing
 finding open without itself sending another wake or creating another finding.
 A verified wake resolves a wake failure, not an unclaimed obligation: delivery
-does not prove pickup.
+does not prove pickup. A wake-origin claim alone also cannot resolve an
+undelivered-wake finding: it is recorded before delivery, so the sweep still
+requires separate delivery or manual-pickup evidence (`bada72674`,
+`deliveryResolutionEvidence`). Other obligation kinds keep their existing
+claim/closure semantics.
 
 A legacy human notice with no owner-notification history can still resolve from
 the existing item-scoped posted ledger when its recipient is confirmed human.
