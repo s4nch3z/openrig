@@ -140,7 +140,9 @@ included; a longer body is cut between whole characters and reads
 `Body: preview; not automatically claimed`, followed by the full-read command.
 An authored empty body is complete; an erased body is unavailable. Typed
 coalesced sends include only their primary member's body; other members name
-their rows and say the body was not included. Erasure scrubs stored wake copies;
+their rows and say the body was not included. Hook-bridge batches also retain
+only their first body-carrying queue wake; omitted-body status is saved for
+replay (`a1a6ca09d`, `HookBridge.poll` / `claimedBy`). Erasure scrubs stored wake copies;
 seat reads of a copy whose queue row is absent omit its text with
 `bodyHeld: qitem_unavailable` (`wakeCopyBodyGate`, queue and seat routes).
 
@@ -165,6 +167,41 @@ unless an unknown-process hold also applies. Tenure or pane-label drift alone
 does not release it. Unknown-process records remain conservative: an empty
 input permits a send without clearing that record. Explicit deliberate
 interaction bypasses this automatic-input hold.
+
+**Claim on wake.** (Checked against
+`a1a6ca09d682219d264fa70f429bca7ac6e55e70`.) Migration
+`196_queue_claim_on_wake` adds
+`queue_items.claim_on_wake` (default 0) and the nullable
+`claim_wake_outbox_id` / `claim_wake_transition_id`. A row created or handed
+off with `claimOnWake` (never inherited by a handoff) renders
+`CLAIMED_BY_WAKE_LINE` only in wakes with a durable intent: `stageWakeIntent`
+(create, handoff successor) and fallback dispatch. Ladder
+and retry text keeps the manual claim line. `claimForWake` claims at the final
+handover and nowhere earlier: for a typed paste or native offer in
+`SendOpts.beforeOwnPayload` (`tmux.ts` `sendTextUnchecked`, `admitNative`),
+after every guard; for the hook bridge inside the poll's batch transaction, one
+savepoint per member, before the hook gets the batch. `claimRow` holds the
+claim's checks and transaction, and subscribers hear of it only after the
+outermost commit. Both routes then run their final checks again, since a
+subscriber may change the seat: a typed refusal there reads
+`draft_wake_superseded`; a bridge member that no longer applies ends not
+delivered, and from the first held one the rest go back to the queue untaken.
+`giveBackWakeClaim` undoes only that wake's own claim, while it is the row's
+newest transition, on positive no-input evidence: `writtenFact` none with no
+live native offer, or a bridge member never handed over. A wake's claim skips
+relay pickup; the row's `claimWakeOutboxId`, `create --verify`, the write
+receipt and the stuck sweep say the claim was the wake's, not the seat's. The
+background drain stays pending-only, so a crash never re-delivers a
+wake-claimed row, and a replayed bridge batch whose claim is gone is marked
+uncertain rather than handed out. Refused before anything is written: a
+person's destination (`claim_on_wake_unsupported_destination`), a write for
+another host (`claim_on_wake_cross_host_unsupported`), and a same-ID retry
+that changes the policy (409 `qitem_claim_on_wake_conflict`).
+
+Stable has no per-task activation or conversation guard in this path; these
+claims use the existing seat/occupant delivery authority. The supported queue
+transfer is staging-only. Its unchanged v2 format omits the local policy and
+claim-correlation columns; staging grants no live delivery authority.
 
 **Which field answers "did it reach them".** `deliveryOutcome` is the gateway
 (human-delivery) ledger, derived at read time
