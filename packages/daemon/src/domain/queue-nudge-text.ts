@@ -42,8 +42,12 @@ export function renderQueueHandoffNudge(qitemId: string, summary: string | null 
 /** Most bytes of a row's body a wake carries, counted on the rendered block: indentation and escapes included. */
 export const QUEUE_WAKE_BODY_MAX_BYTES = 4096;
 
-/** The row's stored body, and whether erasure emptied it (an erased body isn't an empty one). */
-export interface QueueWakeBody { text: string; erased: boolean }
+/** The row's stored body, and whether erasure emptied it (an erased body isn't an empty one). `claimOnWake`: the row
+ *  opted in to a claim by the wake that carries its complete body. */
+export interface QueueWakeBody { text: string; erased: boolean; claimOnWake?: boolean }
+
+/** The claim line of a wake that claims its row as it's written: the delivery writes it only once that claim is made. */
+export const CLAIMED_BY_WAKE_LINE = "Claim: claimed for this seat by this wake; no rig queue claim needed";
 
 /** Every body line is indented, so no body line can read as an envelope line (`---`, From:, ↩ Reply). */
 const BODY_INDENT = "    ";
@@ -59,11 +63,12 @@ function escapedBodyChar(ch: string): string {
   return cp <= 0xff ? `\\x${cp.toString(16).padStart(2, "0")}` : `\\u{${cp.toString(16)}}`;
 }
 
-/** The wake's body section: a completeness line, the claim line, and the body as an indented block of at most
+/** The wake's body section: a completeness line, the claim line (claimed by this wake for an opted-in row whose whole
+ *  body is carried, else required), and the body as an indented block of at most
  *  QUEUE_WAKE_BODY_MAX_BYTES rendered bytes. Unsafe characters are shown escaped; the cut falls between whole
  *  characters (an escape is never split), and a cut body is marked as a preview with the command that reads it all. */
 export function renderQueueWakeBody(qitemId: string, body: QueueWakeBody): string {
-  const claim = `Claim: required — rig queue claim ${shellQuote(qitemId)}`;
+  const claim = body.claimOnWake ? CLAIMED_BY_WAKE_LINE : `Claim: required — rig queue claim ${shellQuote(qitemId)}`;
   if (body.erased) return `${BODY_LINE}unavailable (its content was erased); not automatically claimed`;
   if (body.text === "") return `${BODY_LINE}complete (empty)\n${claim}`;
   let block = BODY_INDENT, bytes = BODY_INDENT.length, cut = false;

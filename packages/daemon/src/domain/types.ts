@@ -401,7 +401,7 @@ export type RigEvent =
   | { type: "queue.create_remote_unknown"; qitemId: string | null; sourceSession: string | null; destinationSession: string | null; hostId: string; failureClass: string }
   | { type: "transport.send_refused"; senderSession: string | null; session: string | null; reason: string; status: number }
   | { type: "queue.handed_off"; qitemId: string; fromSession: string; toSession: string; closureReason: "handed_off_to"; summary: string | null }
-  | { type: "queue.claimed"; qitemId: string; destinationSession: string; claimedAt: string; closureRequiredAt: string | null; summary: string | null }
+  | { type: "queue.claimed"; qitemId: string; destinationSession: string; claimedAt: string; closureRequiredAt: string | null; summary: string | null; wakeOutboxId?: string }
   | { type: "queue.unclaimed"; qitemId: string; destinationSession: string; reason: string; summary: string | null }
   | { type: "qitem.fallback_routed"; qitemId: string; originalDestination: string; rerouteDestination: string; reason: string }
   | { type: "qitem.closure_overdue"; qitemId: string; destinationSession: string; closureRequiredAt: string; overdueSince: string }

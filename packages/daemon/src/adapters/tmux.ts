@@ -2306,7 +2306,7 @@ export class TmuxAdapter {
    * buffer leaks. Unique temp + buffer names per call keep parallel `rig up`
    * seats from colliding.
    */
-  async sendText(target: string, text: string, beforeInput?: () => void, options?: { bracketed?: boolean; beforePaste?: () => Promise<void> }): Promise<TmuxResult> {
+  async sendText(target: string, text: string, beforeInput?: () => void, options?: { bracketed?: boolean; beforePaste?: () => Promise<void>; beforeOwnPayload?: () => void }): Promise<TmuxResult> {
     return this.guardedInput(target, (pane, beforeWrite) => {
       const guard = this.deliveryGuard;
       const identity = this.freshManaged.get(target)?.nodeId ?? target;
@@ -2325,12 +2325,14 @@ export class TmuxAdapter {
         },
         afterPaste: async () => { if (checkDraft) await guard!.notePasted(identity, text); },
       } : undefined;
-      return this.sendTextUnchecked(pane, text, () => { beforeWrite(); beforeInput?.(); }, options?.bracketed, policy);
+      return this.sendTextUnchecked(pane, text, () => { beforeWrite(); beforeInput?.(); }, options?.bracketed, policy, options?.beforeOwnPayload);
     }, false, "text");
   }
 
+  /** `beforeOwnPayload`: called once, after the last checks and immediately before this text's paste (the checks then run
+   *  again); never for a leftover's Enter or an earlier check. */
   private async sendTextUnchecked(target: string, text: string, beforeWrite: () => void, bracketed = true,
-    policy?: { beforePaste: () => Promise<void>; afterPaste: () => Promise<void> }): Promise<TmuxResult> {
+    policy?: { beforePaste: () => Promise<void>; afterPaste: () => Promise<void> }, beforeOwnPayload?: () => void): Promise<TmuxResult> {
     const path = this.fileOps.tmpName();
     const buffer = this.fileOps.bufferName();
     let bufferLoaded = false;
@@ -2343,6 +2345,14 @@ export class TmuxAdapter {
       bufferLoaded = true;
       if (policy) await policy.beforePaste();
       beforeWrite();
+      // A claim made here tells its subscribers, who may change the seat (its occupant, pane, task): the checks run again,
+      // and a refusal then is the wake's own, before any input, as the claim's is.
+      if (beforeOwnPayload) {
+        beforeOwnPayload();
+        try { beforeWrite(); } catch (error) {
+          throw new DeliveryGuardError("draft_wake_superseded", `The seat changed as the queue wake claimed its row (${error instanceof Error ? error.message : String(error)}); no input was written.`);
+        }
+      }
       // Explicit prompt answers need key input, not bracketed-paste framing.
       // Keep their bytes in the file: tmux command parsing and argv limits must
       // not alter semicolons or reject long answers (#519, #602).

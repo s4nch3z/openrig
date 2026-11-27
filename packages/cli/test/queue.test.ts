@@ -495,6 +495,29 @@ describe("rig queue CLI", () => {
     expect(reads).toBe(1);
   });
 
+  // Claim on wake: the daemon claims the row just before the wake's text is written. That claim isn't the seat taking
+  // the item, so it neither ends the wait for the wake's result nor settles the receipt.
+  it("delivery verification doesn't count a wake's own claim as the seat's, or as settling the receipt", async () => {
+    const claimed = { destinationSession: "worker@r", claimedAt: "2026-11-26T22:00:00.000Z", claimWakeOutboxId: "wake-intent-qitem-w",
+      pickup: { state: "working" } };
+    const reads = [{ ...claimed, lastNudgeResult: null }, { ...claimed, lastNudgeResult: "delivered-ack-pending" }];
+    let read = 0;
+    const result = await waitForDeliveryOutcome(
+      { get: async <T>() => ({ status: 200, data: reads[Math.min(read++, reads.length - 1)] as T }) },
+      "qitem-w",
+      { timeoutMs: 60_000, sleep: async () => {} },
+      { destinationSession: "worker@r" },
+    );
+    expect(read).toBe(2);
+    expect(result).toMatchObject({
+      receiptSource: "terminal", outcome: "delivered-ack-pending", wakeResult: "delivered-ack-pending",
+      claim: { observed: true, claimedAt: claimed.claimedAt, pickup: "working", byWake: true },
+      nextAction: "rig queue show qitem-w --json",
+    });
+    expect(result.detail).toContain("Claimed at 2026-11-26T22:00:00.000Z by its wake, just before the wake's text was written (claim on wake), pickup working. That claim is the daemon's, not the seat taking the item, and it does not prove the body was read.");
+    expect(result.detail).toContain("This is not a failed handoff.");
+  });
+
   it("delivery verification reports an unreadable receipt as indeterminate, not rejected", async () => {
     const result = await waitForDeliveryOutcome(
       { get: async () => { throw new Error("daemon read timed out"); } } as never,

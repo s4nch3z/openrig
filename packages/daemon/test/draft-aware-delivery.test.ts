@@ -17,6 +17,7 @@ import { SessionRegistry } from "../src/domain/session-registry.js";
 import { SessionTransport, type SendOpts } from "../src/domain/session-transport.js";
 import { seatRoutes } from "../src/routes/seat.js";
 import { transportRoutes } from "../src/routes/transport.js";
+import { CLAIMED_BY_WAKE_LINE } from "../src/domain/queue-nudge-text.js";
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -416,6 +417,20 @@ describe("current draft-aware delivery through the real transport", () => {
     expect(f.writes.filter(write => write.startsWith("keys:"))).toHaveLength(2);
     expect(f.bodies.a).toBe("");
     expect(f.outbox.getById("wake-intent-" + item.qitemId)!.deliveryState).toBe("delivered");
+  });
+
+  it("claims an opted-in row at the wake's own paste, after the draft checks, never at an earlier check", async () => {
+    const f = fixture(undefined, { runtime: "claude-code" }); await f.enable();
+    const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "claimed work", nudge: false, claimOnWake: true });
+    const state = () => f.repo.getById(item.qitemId)!.state;
+    const seen: string[] = [];
+    f.hooks.load = () => { seen.push(`load:${state()}`); };
+    f.hooks.paste = () => { seen.push(`paste:${state()}`); };
+    f.repo.stageWakeIntent(item.qitemId, "sender@test", "worker@test", null, true);
+    await f.repo.drainPendingWakeIntents();
+    expect(seen).toEqual(["load:pending", "paste:in-progress"]);
+    expect(f.submissions).toEqual([expect.stringContaining(CLAIMED_BY_WAKE_LINE)]);
+    expect(state()).toBe("in-progress");
   });
 
   // Constructed footer transition: U3 retained no immediate pre-Enter snapshot.

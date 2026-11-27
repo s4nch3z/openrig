@@ -228,6 +228,16 @@ describe("queue write receipt (output.compact)", () => {
       expect(plain).toContain("backstop: watchdog:job-1 · due 2026-10-10T18:15:00.000Z · owner worker@r");
     });
 
+    it("a row its wake claimed (claim on wake) says the wake claimed it, and keeps that wake in the JSON receipt", async () => {
+      const data = row({ state: "in-progress", claimedAt: "2026-10-10T18:01:00.000Z", claimWakeOutboxId: "wake-intent-qitem-20261010180000-aaaa" });
+      const route = { "POST /api/queue/qitem-20261010180000-aaaa/update": { status: 200, data } };
+      const plain = await run(["update", "qitem-20261010180000-aaaa", "--note", "n"], route);
+      expect(plain).toContain("claimed by its wake 2026-10-10T18:01:00.000Z");
+      logs = [];
+      const json = JSON.parse(await run(["update", "qitem-20261010180000-aaaa", "--note", "n", "--json"], route)) as Row;
+      expect(json.claimWakeOutboxId).toBe("wake-intent-qitem-20261010180000-aaaa");
+    });
+
     it("a parked write with no timer says so in the daemon's own words", async () => {
       const data = row({ state: "blocked", blockedOn: "external:ci" }, { blocker: { ref: "external:ci", owner: null, state: null },
         nextBackstop: { owner: "worker@r", mechanism: "UNVERIFIED: no timed backstop", dueAt: null, intervalSeconds: null } });

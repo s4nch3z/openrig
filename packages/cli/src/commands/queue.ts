@@ -76,8 +76,9 @@ export interface TerminalDeliveryResult extends DeliveryResultBase {
   /** The row's lastNudgeResult as recorded; null before any wake result. */
   wakeResult: string | null;
   /** A claim shows the seat took the item; it does not prove the body was read.
-   *  pickup is the daemon's derived pickup receipt state, as the row reports it. */
-  claim: { observed: boolean; claimedAt: string | null; pickup: string | null };
+   *  pickup is the daemon's derived pickup receipt state, as the row reports it. byWake: the claim is the wake's own
+   *  (claim on wake), made by the daemon just before the wake's text was written, so it doesn't show the seat took it. */
+  claim: { observed: boolean; claimedAt: string | null; pickup: string | null; byWake?: true };
   /** Present when the gateway may also post this row: a registered person who is also a seat with
    *  its own pane. The Slack receipt, kept apart from the terminal side; posted is not read. */
   gateway?: GatewayReceipt;
@@ -164,7 +165,8 @@ function terminalDeliveryResult(
   const wakeResult = stringField(row, "lastNudgeResult");
   const claimedAt = stringField(row, "claimedAt");
   const pickupState = typeof row.pickup === "object" && row.pickup !== null ? stringField(row.pickup as QueueRow, "state") : null;
-  const claim = { observed: claimedAt !== null, claimedAt, pickup: pickupState };
+  const byWake = claimedAt !== null && stringField(row, "claimWakeOutboxId") !== null;
+  const claim = { observed: claimedAt !== null, claimedAt, pickup: pickupState, ...(byWake ? { byWake: true as const } : {}) };
   const seat = destination ?? "<destination>";
   const receipt: Record<TerminalDeliveryResult["outcome"], string> = {
     "verified": "Terminal receipt confirmed: the wake rendered in the destination pane.",
@@ -183,7 +185,9 @@ function terminalDeliveryResult(
     "still-pending": waitedMs === null ? "No terminal receipt was recorded before the claim." : `No terminal receipt was recorded within ${waitedMs}ms.`,
     "not-requested": "No terminal wake was requested (--no-nudge).",
   };
-  const claimText = claim.observed
+  const claimText = byWake
+    ? `Claimed at ${claimedAt} by its wake, just before the wake's text was written (claim on wake)${pickupState ? `, pickup ${pickupState}` : ""}. That claim is the daemon's, not the seat taking the item, and it does not prove the body was read.`
+    : claim.observed
     ? `Claimed at ${claimedAt}${pickupState ? ` (pickup ${pickupState})` : ""}. A claim shows the seat took the item; it does not prove the body was read.`
     : waitedMs === null ? "No claim observed yet." : `No claim observed within ${waitedMs}ms.`;
   const gatewaySide = gatewayAlsoPosts(row);
@@ -193,9 +197,9 @@ function terminalDeliveryResult(
     : gateway.outcome === "still-pending" ? (waitedMs === null ? " No Slack receipt yet." : ` No Slack receipt within ${waitedMs}ms.`)
     : ` Slack delivery ${gateway.outcome}${gateway.detail ? `: ${gateway.detail}` : ""}.`;
   const gatewayFailed = gateway !== null && gateway.connectorAccepted === false;
-  const notFailed = !claim.observed && !gatewayFailed && isKnownUnconfirmed(wakeResult, outcome) ? " This is not a failed handoff." : "";
+  const notFailed = (!claim.observed || byWake) && !gatewayFailed && isKnownUnconfirmed(wakeResult, outcome) ? " This is not a failed handoff." : "";
   const destinationKind = terminalDestinationKind(destination, gatewaySide);
-  const settled = claim.observed && (gateway === null || gateway.outcome === "posted");
+  const settled = claim.observed && !byWake && (gateway === null || gateway.outcome === "posted");
   return {
     receiptSource: "terminal",
     destinationKind,
@@ -296,7 +300,9 @@ export async function waitForDeliveryOutcome(
       // is `rig queue show`'s to report. When the gateway may also post the row, its receipt is
       // awaited too. Only a missing receipt waits, up to the bound. Nothing here re-sends anything.
       const gatewaySide = gatewayAlsoPosts(row);
-      const terminalSettled = outcome === "not-requested" || wakeResult !== null || stringField(row, "claimedAt") !== null;
+      // A wake's own claim (claim on wake) is made before its text is written: it settles nothing; its result does.
+      const terminalSettled = outcome === "not-requested" || wakeResult !== null
+        || (stringField(row, "claimedAt") !== null && stringField(row, "claimWakeOutboxId") === null);
       const gatewaySettled = !gatewaySide || stringField(row, "deliveryOutcome") !== null;
       if (terminalSettled && gatewaySettled) {
         return terminalDeliveryResult(qitemId, destination, row, outcome, null);
@@ -1363,7 +1369,16 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .option("--json", "JSON output for agents")
     .option("--id-only", "Print only the created row's ID on stdout, once the daemon confirms the row. Before sending, stderr gets one short line with the request's ID (not yet confirmed); full recovery guidance appears only when the outcome is unknown. Warnings and --verify's delivery receipt still go to stderr. Not with --json or --full")
     .option("--quiet", "Same as --id-only")
-    .option("--claim-on-wake", "Let the wake that carries this row's complete body claim it for the destination seat, so that seat needn't run rig queue claim. Without it the row waits for a manual claim, as before. Not for a person's address or another host")
+    .option("--claim-on-wake", "Let the wake that carries this row's complete body claim it for the destination seat, so that seat needn't run rig queue claim. Without it the row waits for a manual claim, as before. A body over the wake's 4 KiB arrives as a preview and isn't claimed; with --no-nudge the row is claimed only when a later wake carries it. Not for a person's address or another host")
+    .addHelpText("after", `
+A seat's wake carries the row's body (up to 4 KiB rendered; a longer one arrives as a preview with the command that
+reads the rest), so the seat can start without rig queue show. Without --claim-on-wake it claims the row itself:
+  rig queue create --destination dev-impl@team --summary "Fix the import dedupe" --body-file brief.md
+  rig queue create --destination dev-impl@team --summary "Fix the import dedupe" --body-file brief.md --claim-on-wake
+For a script, --id-only prints only the confirmed ID. Empty stdout doesn't prove nothing was written: when stderr says
+the outcome is unknown, retry with --id <the request ID it names> and the same flags, never as a new create:
+  id=$(rig queue create --destination dev-impl@team --summary "Fix the import dedupe" --body-file brief.md --id-only)
+`)
     .action(async (opts: {
       source?: string;
       destination: string;

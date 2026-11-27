@@ -86,7 +86,9 @@ import { isTypedGateBlocker, typedGateBlockerPrefix } from "./queue-blocker.js";
 export { TYPED_GATE_BLOCKER_PREFIXES, isTypedGateBlocker, typedGateBlockerPrefix } from "./queue-blocker.js";
 import { isOpenRigSender, OPENRIG_SENDER, wrapPaneEnvelope } from "../lib/pane-envelope.js";
 import { isBoundTerminalSeat } from "./terminal-seat.js";
-import { renderQueueHandoffNudge, withoutQueueWakeBody, type QueueWakeBody } from "./queue-nudge-text.js";
+import { CLAIMED_BY_WAKE_LINE, renderQueueHandoffNudge, withoutQueueWakeBody, type QueueWakeBody } from "./queue-nudge-text.js";
+import { writtenFact } from "./session-transport.js";
+import type { WakeClaims } from "./draft-aware-delivery.js";
 import { getSelfHostId } from "./hosts/fanout-contract.js";
 import { parseSessionName, isHumanSeatSessionRef } from "./session-name.js";
 import { isEpisodeRelay, RELAY_CLAIMED_PREFIX, RELAY_FOR_PREFIX, RELAY_KEY_PREFIX, RELAY_TAG } from "./return-route.js";
@@ -215,7 +217,8 @@ const FALLBACK_ACTOR = "system:queue-fallback";
 /** The actor a terminal act is recorded as when it names no responder: explicitly unattributed, never a person. */
 export const UNATTRIBUTED_ACTOR = "human@host";
 
-/** A row's body as its wake carries it: an erased row's emptied body isn't an authored empty one. */
+/** A row's body as its wake carries it: an erased row's emptied body isn't an authored empty one. Never claimed by the
+ *  wake: only a producer that records a durable wake entry, which the claim names, adds the row's claimOnWake. */
 export function wakeBody(row: Pick<QueueItem, "body" | "contentErasedAt">): QueueWakeBody {
   return { text: row.body ?? "", erased: !!row.contentErasedAt };
 }
@@ -225,6 +228,7 @@ export function wakeBody(row: Pick<QueueItem, "body" | "contentErasedAt">): Queu
  * the wake send could get. While the row is claimed, an unconfirmed wire result
  * (`delivered-ack-pending` or `indeterminate:*`) is presented as `claimed`. The stored
  * result is never rewritten, so a re-wake or an unclaim reads the wire result again.
+ * A wake's own claim (claim on wake) is the daemon acting, not the destination: callers pass no claimedAt for it.
  */
 export function presentedNudgeResult(wireResult: string | null, claimedAt: string | null): string | null {
   if (!claimedAt || wireResult === null) return wireResult;
@@ -347,6 +351,9 @@ export interface QueueItem {
   returnRouteBasis?: string | null;
   /** Present only on a row that opted in (`--claim-on-wake`): the wake that carries its complete body claims it. */
   claimOnWake?: true;
+  /** Present only while the row's claim is its wake's (claim on wake): that wake's outbox entry. The daemon made that
+   *  claim just before the wake's text was written, so it isn't the seat taking the row. */
+  claimWakeOutboxId?: string;
   /** Present only on compact list rows, which omit these fields entirely so omitted content
    *  can't be mistaken for an empty value. Full reads never carry this marker. */
   fieldsElided?: Array<(typeof COMPACT_ELIDED_FIELDS)[number]>;
@@ -416,6 +423,7 @@ interface QueueItemRow {
   return_route?: string | null;
   return_route_basis?: string | null;
   claim_on_wake?: number | null;
+  claim_wake_outbox_id?: string | null;
 }
 
 /**
@@ -431,7 +439,13 @@ export interface QueueNudgeTransport {
   deliveryTarget?(session: string): import("./seat-delivery-guard.js").GuardTarget | null;
   retentionTarget?(session: string, input?: import("./seat-delivery-guard.js").AdmissionInput): import("./seat-delivery-guard.js").GuardTarget | null;
   draftAwareTarget?(session: string): import("./seat-delivery-guard.js").GuardTarget | null;
-  configureGuardedWakes?(applicable: (entries: readonly QueueWakeFacts[]) => boolean): void;
+  /** `claims.claim`: called once for a wake's primary entry, just before its own text is handed over (pasted, offered, or
+   *  returned to the seat's hook), after every check; it claims the row when that text carries the claimed-by-wake line,
+   *  and throws when it can't (nothing is written). It returns null when there was nothing to claim, else the claim's
+   *  notification, to send once the caller's outermost transaction has committed; the text goes only if it returns true.
+   *  `holds` and `giveBack` serve a handover that comes later or not at all (the hook bridge's replay, a batch not
+   *  returned after all). */
+  configureGuardedWakes?(applicable: (entries: readonly QueueWakeFacts[]) => boolean, claims?: WakeClaims): void;
   send(
     sessionName: string,
     // (h): stampISO threads the nudge's compose time so the transport's delivered-latency calc can
@@ -666,6 +680,9 @@ export interface QueueClaimInput {
   identityProvenance?: string | null;
   /** With `principal:v1`: the caller the local MCP adapter named (resolveRecordedIdentity). */
   identityPrincipal?: string | null;
+  /** Claim on wake: the wake entry claiming the row just before its text is written. That isn't the seat picking the row
+   *  up, so no relay pickup is recorded; the row and the event name the wake. */
+  wakeOutboxId?: string;
 }
 
 /** A row as a handoff successor shows it (QueueRepository.handoffSuccessorReads). */
@@ -1059,7 +1076,8 @@ const COMPACT_QUEUE_COLUMNS = COMPACT_QUEUE_COLUMN_NAMES.join(", ");
 /** The row fields a delivery ledger reads. A compact listing selects only COMPACT_QUEUE_COLUMN_NAMES, so each must be
  *  one of them: dropping one from that list leaves its field off this type, and its read fails to compile. */
 type LedgerRow = Pick<QueueItemRow, Extract<(typeof COMPACT_QUEUE_COLUMN_NAMES)[number],
-  "qitem_id" | "state" | "blocked_on" | "destination_session" | "ts_created" | "last_nudge_result" | "claimed_at">>;
+  "qitem_id" | "state" | "blocked_on" | "destination_session" | "ts_created" | "last_nudge_result" | "claimed_at">>
+  & Pick<QueueItemRow, "claim_wake_outbox_id">;
 
 /**
  * Stamp-at-FORWARD only (founder root invariant 2026-08-27, superseding 51-09 incr 4
@@ -1447,11 +1465,66 @@ export class QueueRepository {
       if (!row || row.destinationSession !== entry.destinationSession) return false;
       // Erasure after the wake's text was rendered scrubbed its stored copy: the text in hand may still carry the body.
       if (row.contentErasedAt && this.outbox?.getById(entry.outboxId)?.body === "") return false;
-      return entry.outboxId.startsWith(WAKE_INTENT_PREFIX) ? this.currentWakeIntent(entry) : isBlockerLive(row.state);
-    }));
+      return entry.outboxId.startsWith(WAKE_INTENT_PREFIX) ? this.currentWakeIntent(entry, true) : isBlockerLive(row.state);
+    }), {
+      claim: (entry, recipient) => this.claimForWake(entry, recipient),
+      holds: (entry) => !!entry.auditPointer && this.wakeClaim(entry.auditPointer)?.outboxId === entry.outboxId,
+      giveBack: (entry, reason) => { if (entry.auditPointer) this.giveBackWakeClaim(entry.auditPointer, entry.outboxId, reason); },
+    });
   }
 
-  private currentWakeIntent(entry: QueueWakeFacts): boolean {
+  /** Claim on wake: a wake's primary entry claims its row just before its own text is written, when that frozen text
+   *  carries the claimed-by-wake line (an opted-in row whose whole body it carries). A later check of the same wake finds
+   *  the claim made; a claim that's refused throws, so the text isn't written: an expired or blocked row isn't claimed.
+   *  Returns null when there's nothing to claim, else the claim's notification, which the caller sends once its outermost
+   *  transaction has committed: it says whether the claim still holds after subscribers were told (one may have moved the
+   *  row on at once, closed or unclaimed it), and the text is written only if it does. */
+  private claimForWake(entry: QueueWakeFacts, recipient: string): (() => boolean) | null {
+    if (!this.hasClaimOnWakeColumn || !entry.auditPointer || !entry.outboxId.startsWith(WAKE_INTENT_PREFIX)) return null;
+    if (!this.outbox?.getById(entry.outboxId)?.body.split("\n").includes(CLAIMED_BY_WAKE_LINE)) return null;
+    const qitemId = entry.auditPointer;
+    const held = () => this.wakeClaim(qitemId)?.outboxId === entry.outboxId;
+    if (held()) return held;
+    const row = this.getById(qitemId);
+    if (row && row.state !== "pending") throw new Error(`its row is ${row.state}`);
+    if (row?.expiresAt && Date.parse(row.expiresAt) <= Date.now()) throw new Error(`its row expired at ${row.expiresAt}`);
+    const event = this.claimRow({ qitemId, destinationSession: recipient, wakeOutboxId: entry.outboxId });
+    return () => { this.eventBus.notifySubscribers(event); return held(); };
+  }
+
+  /** The wake that claimed an in-progress row, and its claim transition; null for a manual claim or any other state. */
+  private wakeClaim(qitemId: string): { outboxId: string; transitionId: number } | null {
+    if (!this.hasClaimOnWakeColumn) return null;
+    const row = this.db.prepare("SELECT state, claim_wake_outbox_id, claim_wake_transition_id FROM queue_items WHERE qitem_id = ?").get(qitemId) as
+      { state: string; claim_wake_outbox_id: string | null; claim_wake_transition_id: number | null } | undefined;
+    return row?.state === "in-progress" && row.claim_wake_outbox_id && row.claim_wake_transition_id !== null
+      ? { outboxId: row.claim_wake_outbox_id, transitionId: row.claim_wake_transition_id } : null;
+  }
+
+  /** A wake that claimed its row and then wrote nothing (positive proof only) gives the claim back, while it's still the
+   *  row's newest transition: once anything else happened to the row, the claim stays. A native offer the runner channel
+   *  stored and didn't reject isn't that proof even before its runner takes it (stage pending), and even when the send's
+   *  result lost it: the runner may still submit it. */
+  private undoWakeClaim(qitemId: string, outboxId: string, res: Awaited<ReturnType<QueueNudgeTransport["send"]>>): void {
+    const offer = this.outbox?.runnerReceipt(outboxId);
+    if (writtenFact(res as import("./session-transport.js").SendResult) !== "none" || (offer && offer.stage !== "rejected")) return;
+    this.giveBackWakeClaim(qitemId, outboxId, "the wake that claimed it wrote no input");
+  }
+
+  /** The claim `outboxId`'s wake made, given back because its text never reached the seat: only while it's still the
+   *  row's newest transition. */
+  private giveBackWakeClaim(qitemId: string, outboxId: string, reason: string): void {
+    const claim = this.wakeClaim(qitemId);
+    if (claim?.outboxId !== outboxId) return;
+    const newest = this.db.prepare("SELECT MAX(transition_id) AS id FROM queue_transitions WHERE qitem_id = ?").get(qitemId) as { id: number | null };
+    if (newest.id !== claim.transitionId) return;
+    const row = this.getById(qitemId);
+    if (row) this.unclaim(qitemId, row.destinationSession, reason);
+  }
+
+  /** `inSend`: the check runs within that wake's own send, where its own claim keeps it current. A drain choosing what to
+   *  send passes nothing, so a row a wake claimed is never sent again (after a crash, say). */
+  private currentWakeIntent(entry: QueueWakeFacts, inSend = false): boolean {
     const row = entry.auditPointer ? this.db.prepare("SELECT state, destination_session FROM queue_items WHERE qitem_id=?").get(entry.auditPointer) as { state: string; destination_session: string } | undefined : undefined;
     // That notice stays current while the row stays closed by the close that made it; every other wake, while its row
     // waits on its destination. A reopen and another close end it: its text names the earlier successor.
@@ -1465,6 +1538,8 @@ export class QueueRepository {
         .get(entry.auditPointer, ...TERMINAL_QUEUE_STATES, ...TERMINAL_QUEUE_STATES) as { transition_id: number } | undefined;
       return Number(entry.outboxId.slice(CLAIM_OVERRIDDEN_WAKE_PREFIX.length)) === close?.transition_id;
     }
+    // A wake that claimed its row stays current for its own later checks (its Enter); no other in-progress row does.
+    if (inSend && row?.state === "in-progress" && row.destination_session === entry.destinationSession) return this.wakeClaim(entry.auditPointer!)?.outboxId === entry.outboxId;
     if (row?.state !== "pending" || row.destination_session !== entry.destinationSession) return false;
     // A reroute that stages a wake replaces the row's earlier wakes for that seat: its create wake, an earlier reroute's
     // wake and an earlier unpark's wake. Without this, a row that comes back to a seat it was rerouted away from would
@@ -1694,7 +1769,8 @@ export class QueueRepository {
       fromSession,
       toSession,
       identityProvenance,
-      bareBody: renderQueueHandoffNudge(successorQitemId, successor?.summary, successor ? wakeBody(successor) : undefined),
+      bareBody: renderQueueHandoffNudge(successorQitemId, successor?.summary,
+        successor ? { ...wakeBody(successor), claimOnWake: successor.claimOnWake === true } : undefined),
       tags: successor?.handedOffFrom || trigger === "openrig"
         ? [...(successor?.handedOffFrom ? [`queue:return:${successor.handedOffFrom}`] : []), ...(trigger === "openrig" ? [WAKE_TRIGGER_OPENRIG_TAG] : [])]
         : undefined,
@@ -2610,6 +2686,7 @@ export class QueueRepository {
         deliveryId: committedOutboxIds ? undefined : deliveryId, auditPointer: qitemId, queueWake: true,
         ...(trigger === "openrig" ? { openrigNotice: true as const } : {}), ...(admission.urgentBy ? { urgent: { by: admission.urgentBy } } : {}),
         ...(recheckMembers ? { recheckMembers } : {}), ...(explicit ? { drainExempt: true as const } : {}) });
+      if (committedOutboxIds?.[0]) this.undoWakeClaim(qitemId, committedOutboxIds[0], res);
       // OPR.0.3.2.21.FR-4(c) — wording rename: the prior literal
       // "sent-unverified" read as a failure even in the common case
       // (delivery confirmed but the synchronous ack window expired,
@@ -3917,6 +3994,13 @@ export class QueueRepository {
    * Mark a qitem `in-progress` (claim). Computes closure_required_at from tier.
    */
   claim(input: QueueClaimInput): QueueItem {
+    this.eventBus.notifySubscribers(this.claimRow(input));
+    return this.getByIdOrThrow(input.qitemId);
+  }
+
+  /** A claim's checks and transaction, telling no one: the caller notifies once the outermost transaction it runs in
+   *  has committed. */
+  private claimRow(input: QueueClaimInput): PersistedEvent {
     const qitem = this.getById(input.qitemId);
     if (!qitem) {
       throw new QueueRepositoryError(
@@ -3967,7 +4051,7 @@ export class QueueRepository {
           .run(ts, ts, closureRequiredAt, input.qitemId);
       }
 
-      this.transitionLog.append({
+      const claimed = this.transitionLog.append({
         qitemId: input.qitemId,
         state: "in-progress",
         actorSession: input.destinationSession,
@@ -3978,8 +4062,13 @@ export class QueueRepository {
         identityProvenance: input.identityProvenance ?? null, // P21 §4 era-stamp
         identityPrincipal: input.identityPrincipal ?? null,
       });
+      // A wake's claim names its wake and transition; a manual claim clears an earlier wake's.
+      if (this.hasClaimOnWakeColumn) {
+        this.db.prepare("UPDATE queue_items SET claim_wake_outbox_id = ?, claim_wake_transition_id = ? WHERE qitem_id = ?")
+          .run(input.wakeOutboxId ?? null, input.wakeOutboxId ? claimed.transitionId : null, input.qitemId);
+      }
 
-      this.recordRelayPickup(qitem, input.destinationSession);
+      if (!input.wakeOutboxId) this.recordRelayPickup(qitem, input.destinationSession);
 
       // OPR.0.5.8.1 S1b — CLAIM-RESUME. A blocked row is claimable ("only
       // pending/blocked are claimable"), so claiming is a real exit from a park
@@ -3996,12 +4085,11 @@ export class QueueRepository {
         claimedAt: ts,
         closureRequiredAt,
         summary: qitem.summary ?? null,
+        ...(input.wakeOutboxId ? { wakeOutboxId: input.wakeOutboxId } : {}),
       });
     });
 
-    const persistedEvent = txn();
-    this.eventBus.notifySubscribers(persistedEvent);
-    return this.getByIdOrThrow(input.qitemId);
+    return txn();
   }
 
   unclaim(qitemId: string, destinationSession: string, reason: string, identityProvenance?: string | null, identityPrincipal?: string | null): QueueItem {
@@ -4020,7 +4108,8 @@ export class QueueRepository {
     const txn = this.db.transaction(() => {
       // (e/Class-B): returning to pending releases the claim, so clear the claimant-generation stamp
       // (the item is now unclaimed; a fresh claimant will re-stamp its own generation).
-      const clearGen = this.hasClaimedGenColumn ? ", claimed_by_generation_uuid = NULL" : "";
+      const clearGen = (this.hasClaimedGenColumn ? ", claimed_by_generation_uuid = NULL" : "")
+        + (this.hasClaimOnWakeColumn ? ", claim_wake_outbox_id = NULL, claim_wake_transition_id = NULL" : "");
       this.db
         .prepare(
           `UPDATE queue_items
@@ -6061,7 +6150,8 @@ export class QueueRepository {
    *  routed row's return route, which isn't elided, so a routed row never lists as unrouted. */
   private compactColumns(): string {
     return COMPACT_QUEUE_COLUMNS + (this.hasSummaryColumn ? ", summary" : "") + (this.hasHumanIntentColumn ? ", human_intent" : "")
-      + (this.hasReturnRouteColumn ? ", return_route, return_route_basis" : "");
+      + (this.hasReturnRouteColumn ? ", return_route, return_route_basis" : "")
+      + (this.hasClaimOnWakeColumn ? ", claim_on_wake, claim_wake_outbox_id" : "");
   }
 
   /**
@@ -7245,7 +7335,7 @@ export class QueueRepository {
       closureRequiredAt: row.closure_required_at,
       claimedAt: row.claimed_at,
       lastNudgeAttempt: row.last_nudge_attempt,
-      lastNudgeResult: presentedNudgeResult(row.last_nudge_result, row.claimed_at),
+      lastNudgeResult: presentedNudgeResult(row.last_nudge_result, row.claim_wake_outbox_id ? null : row.claimed_at),
       lastNudgeWireResult: row.last_nudge_result,
       lastHeartbeat: row.last_heartbeat,
       resolution: row.resolution,
@@ -7255,6 +7345,7 @@ export class QueueRepository {
       ...(row.content_erased_at ? { contentErasedAt: row.content_erased_at } : {}),
       ...(row.return_route ? { returnRoute: row.return_route, returnRouteBasis: row.return_route_basis ?? null } : {}),
       ...(row.claim_on_wake ? { claimOnWake: true as const } : {}),
+      ...(row.claim_wake_outbox_id ? { claimWakeOutboxId: row.claim_wake_outbox_id } : {}),
     };
   }
 }
@@ -7283,7 +7374,7 @@ function ledgerItem(row: LedgerRow): LedgerItem {
     blockedOn: row.blocked_on,
     destinationSession: row.destination_session,
     tsCreated: row.ts_created,
-    lastNudgeResult: presentedNudgeResult(row.last_nudge_result, row.claimed_at),
+    lastNudgeResult: presentedNudgeResult(row.last_nudge_result, row.claim_wake_outbox_id ? null : row.claimed_at),
   };
 }
 

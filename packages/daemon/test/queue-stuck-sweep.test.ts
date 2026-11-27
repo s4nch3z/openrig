@@ -1549,6 +1549,19 @@ describe("S02 standing stuck sweep — both halves, routed findings, quiet-but-o
     expect(repo.getById(after[0]!.qitemId)?.state).toBe("done");
   });
 
+  it("a finding closed by a wake's own claim (claim on wake) says the wake claimed it, not the seat", async () => {
+    const row = await mkRow();
+    failNudge(row.qitemId);
+    await runSweep();
+    expect(await findingsFor(row.qitemId)).toHaveLength(1);
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r", wakeOutboxId: `wake-intent-${row.qitemId}` });
+    await runSweep();
+    const [finding] = await findingsFor(row.qitemId);
+    expect(repo.getById(finding!.qitemId)?.state).toBe("done");
+    const resolution = repo.listTransitions(finding!.qitemId).at(-1)?.transitionNote ?? "";
+    expect(resolution).toContain(`source claimed by its wake at ${repo.getById(row.qitemId)!.claimedAt}, not by the seat`);
+  });
+
   it("#1419 RESOLUTION BEATS SUPPRESSION: a fresh marker does not keep a finding open after the source is completed", async () => {
     const mod = await sweepMod();
     const row = await mkRow();

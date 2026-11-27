@@ -33,7 +33,7 @@ import {
 export { inspectStartupStagedText } from "./startup-submission-evidence.js";
 import { OutboxHandler, OutboxHandlerError } from "./outbox-handler.js";
 import { declaredCapabilities, readSendOutcome, type WrittenFact } from "./connection-contract.js";
-import { DraftAwareDelivery, type GuardedDeliverySummary, type QueueWakeFacts } from "./draft-aware-delivery.js";
+import { DraftAwareDelivery, type GuardedDeliverySummary, type QueueWakeFacts, type WakeClaims } from "./draft-aware-delivery.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import { communityHarnessOf } from "./built-in-runtimes.js";
@@ -2062,6 +2062,9 @@ export interface SendOpts {
   onInputEffect?: (phase: "pasted" | "submitted", written?: { text: string }) => void;
   /** Internal managed lifecycle prerequisite; never accepted from HTTP send options. */
   beforeWrite?: () => void;
+  /** Internal: called once, immediately before this send's own text is pasted or offered, after every check there
+   *  (beforeWrite included, which then runs again); never at an earlier check or before an Enter. A throw writes nothing. */
+  beforeOwnPayload?: () => void;
   /** Explicit internal composer-preservation request. Managed compaction instead uses ordinary draft-delivery defaults.
    *  `"typed"` (#2575) holds only a box that reads typed or typed-with-suggestion; any other reading that isn't empty is
    *  pasted over and named in `pastedOverInputBox`, never called empty. */
@@ -2414,6 +2417,7 @@ export class SessionTransport {
   private eventBus?: EventBus;
   private hookBridge?: HookBridge;
   private queueWakeApplicable?: (entries: readonly QueueWakeFacts[]) => boolean;
+  private queueWakeClaims?: WakeClaims;
   private hookBridgeSweep: Promise<Array<{ outboxId: string; result: SendResult }>> | null = null;
   private hookBridgeSweepAgain = false;
   private now: () => Date;
@@ -2455,11 +2459,31 @@ export class SessionTransport {
       (session, text, opts) => this.sendUnguarded(session, text, opts));
   }
 
-  configureGuardedWakes(applicable: (entries: readonly QueueWakeFacts[]) => boolean): void {
+  configureGuardedWakes(applicable: (entries: readonly QueueWakeFacts[]) => boolean, claims?: WakeClaims): void {
     this.guardedDelivery?.configureWakes(applicable);
     // The hook bridge checks the same predicate before it queues an automatic wake and before it hands one over.
     this.queueWakeApplicable = applicable;
-    if (this.hookBridge) this.hookBridge.wakeApplicable = applicable;
+    this.queueWakeClaims = claims;
+    if (this.hookBridge) { this.hookBridge.wakeApplicable = applicable; this.hookBridge.wakeClaims = claims; }
+  }
+
+  /** Claim on wake: a queue wake's primary entry may claim its row immediately before the wake's own text is pasted or
+   *  offered, on every typed and native route. A claim that's refused writes nothing. */
+  private wakeClaimed(sessionName: string, opts: SendOpts | undefined): SendOpts | undefined {
+    const claims = this.queueWakeClaims;
+    const primary = opts?.committedOutboxIds?.[0];
+    if (!opts?.queueWake || opts.drainExempt || !claims || !primary) return opts;
+    return { ...opts, beforeOwnPayload: () => {
+      opts.beforeOwnPayload?.();
+      const entry = new OutboxHandler(this.db).getById(primary);
+      try {
+        if (!entry) throw new Error("its wake entry is gone");
+        const notify = claims.claim(entry, sessionName);
+        if (notify && !notify()) throw new Error("its row moved on as it was claimed");
+      } catch (error) {
+        throw new DeliveryGuardError("draft_wake_superseded", `The queue wake couldn't claim its row (${error instanceof Error ? error.message : String(error)}); no input was written.`);
+      }
+    } };
   }
 
   /** A queue wake's last check before each of its writes (the paste or the native offer, then Enter), on the routes that
@@ -3167,6 +3191,17 @@ export class SessionTransport {
     if (primary?.guardBinding && JSON.stringify(primary.guardBinding) !== JSON.stringify(target))
       throw new DeliveryGuardError("guard_target_changed", "The retained native input belongs to another occupant; no input offered.");
     opts?.beforeWrite?.();
+    if (opts?.beforeOwnPayload) {
+      // A claim made here tells its subscribers, who may change the seat (its occupant, task): the checks run again, and
+      // a refusal then is the wake's own, before any offer, as the claim's is.
+      opts.beforeOwnPayload();
+      try {
+        if (JSON.stringify(this.tmuxAdapter.deliveryGuard!.target(sessionName)) !== JSON.stringify(target)) throw new Error("its target changed");
+        opts.beforeWrite?.();
+      } catch (error) {
+        throw new DeliveryGuardError("draft_wake_superseded", `The seat changed as the queue wake claimed its row (${error instanceof Error ? error.message : String(error)}); no input was offered.`);
+      }
+    }
     const receipt = this.runnerChannel.admit(target.nodeId, { outboxId: ids[0]!, senderSession: opts?.committedOutboxIds ? primary?.senderSession ?? "unknown" : opts?.actorSession ?? "unknown",
       destinationSession: sessionName, body: opts?.committedOutboxIds ? primary?.body ?? text : text, kind: opts?.nativeWake ? "wake" : "input", inputRoute: "native", payload: opts?.nativeWake ? { question: text } : { text },
       ...(ids.length > 1 ? { memberIds: ids } : {}),
@@ -3292,7 +3327,7 @@ export class SessionTransport {
         if (taken) return taken;
         const members = recheck(false);
         const memberText = members?.text ?? text;
-        const memberOpts = members ? { ...sendOpts, committedOutboxIds: members.outboxIds } : sendOpts;
+        const memberOpts = this.wakeClaimed(sessionName, members ? { ...sendOpts, committedOutboxIds: members.outboxIds } : sendOpts);
         const currentIds = memberOpts?.committedOutboxIds ?? ids;
         const route = inputRoute(guard.target(sessionName).nodeId);
         if (memberOpts?.nativeWake && route !== "native")
@@ -4197,12 +4232,15 @@ export class SessionTransport {
       () => {
         opts?.beforeWrite?.();
         writeIssued = true;
+        // The adapter calls it once, right before the paste itself, after the checks there.
+        const own = opts?.beforeOwnPayload ? { beforeOwnPayload: opts.beforeOwnPayload } : undefined;
         if (checkOriginal) return this.tmuxAdapter.sendText(sessionName, text, () => { beforeOriginalInput(); beforePaste?.(); }, {
-          ...(promptOverride ? { bracketed: false } : {}), beforePaste: async () => { await overrideBeforePaste?.(); await checkOriginal(); if (preserveInput) await preserveInput(); },
+          ...(promptOverride ? { bracketed: false } : {}), beforePaste: async () => { await overrideBeforePaste?.(); await checkOriginal(); if (preserveInput) await preserveInput(); }, ...own,
         });
         if (promptOverride) return this.tmuxAdapter.sendText(sessionName, text, beforePaste, { bracketed: false,
-          beforePaste: preserveInput ? async () => { await overrideBeforePaste?.(); await preserveInput(); } : overrideBeforePaste });
-        if (preserveInput) return this.tmuxAdapter.sendText(sessionName, text, beforePaste, { beforePaste: preserveInput });
+          beforePaste: preserveInput ? async () => { await overrideBeforePaste?.(); await preserveInput(); } : overrideBeforePaste, ...own });
+        if (preserveInput) return this.tmuxAdapter.sendText(sessionName, text, beforePaste, { beforePaste: preserveInput, ...own });
+        if (own) return this.tmuxAdapter.sendText(sessionName, text, beforePaste, own);
         return beforePaste ? this.tmuxAdapter.sendText(sessionName, text, beforePaste) : this.tmuxAdapter.sendText(sessionName, text);
       },
       (result) => result.ok ? "ok" : "failed",

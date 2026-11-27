@@ -18,7 +18,8 @@ import type Database from "better-sqlite3";
 import { OutboxHandler } from "./outbox-handler.js";
 import type { RigEvent } from "./types.js";
 import type { AdmissionInput } from "./seat-delivery-guard.js";
-import type { QueueWakeFacts } from "./draft-aware-delivery.js";
+import type { QueueWakeFacts, WakeClaims } from "./draft-aware-delivery.js";
+import { withoutQueueWakeBody } from "./queue-nudge-text.js";
 
 /** The hooks' `timeout` (seconds): past an hour idle, so a waiter stays armed through a long idle (7200 measured). */
 export const HOOK_BRIDGE_TIMEOUT_SECONDS = 7200;
@@ -74,6 +75,11 @@ interface BridgeReceipt {
   claimedAt?: string;
   hookEvent?: string;
   ackedAt?: string;
+  /** Taken in a batch after another queue wake's body: its own body section was replaced by a "not included" line, so a
+   *  replay hands over the same text. */
+  bodyOmitted?: boolean;
+  /** Its queue wake claimed the row when the poll took it. */
+  wakeClaimed?: boolean;
 }
 interface QueuedRow { outboxId: string; body: string; senderSession: string; sessionName: string; auditPointer: string | null; queuedAt: string;
   occupant: string | null; admission: HookBridgeAdmission | null; automatic: boolean }
@@ -130,6 +136,10 @@ export class HookBridge {
   /** Whether a queue wake still applies (QueueRepository's current-wake predicate, which the typed path also checks):
    *  set by the transport when the queue attaches. */
   wakeApplicable?: (entries: readonly QueueWakeFacts[]) => boolean;
+  /** Claim on wake (QueueRepository), set with wakeApplicable: claims a wake's row, inside the poll's batch transaction,
+   *  when the text handed over says the row is claimed for the seat; checks that claim on a replay, and gives it back
+   *  when the batch isn't handed over after all. */
+  wakeClaims?: WakeClaims;
 
   constructor(readonly db: Database.Database, private readonly deps: {
     now?: () => number;
@@ -358,12 +368,13 @@ export class HookBridge {
     return released;
   }
 
-  /** A queued message whose occupant is gone isn't typed into the seat's new one: it ends not delivered, and says why. */
-  abandon(nodeId: string, sessionName: string, outboxId: string, reason: string): boolean {
+  /** A queued message whose occupant is gone isn't typed into the seat's new one: it ends not delivered, and says why.
+   *  `from`: a message the poll took but hasn't handed over yet ends the same way. */
+  abandon(nodeId: string, sessionName: string, outboxId: string, reason: string, from: "queued" | "claimed" = "queued"): boolean {
     const ended = this.db.prepare(`UPDATE outbox_entries SET delivery_state = 'failed',
       guard_delivery = json_set(guard_delivery, '$.state', 'not-delivered', '$.reason', ?)
-      WHERE outbox_id = ? AND delivery_state = 'sending' AND json_extract(guard_delivery, '$.channel') = ? AND json_extract(guard_delivery, '$.state') = 'queued'`)
-      .run(reason, outboxId, HOOK_BRIDGE_CHANNEL).changes === 1;
+      WHERE outbox_id = ? AND delivery_state = 'sending' AND json_extract(guard_delivery, '$.channel') = ? AND json_extract(guard_delivery, '$.state') = ?`)
+      .run(reason, outboxId, HOOK_BRIDGE_CHANNEL, from).changes === 1;
     if (ended) {
       this.deps.emit?.({ type: "transport.hook_bridge_fallback", nodeId, sessionName, outboxIds: [outboxId], reason: `not delivered: ${reason}` });
       this.ended({ outboxId, kind: "not-delivered", reason });
@@ -427,11 +438,14 @@ export class HookBridge {
     const again = this.claimedBy(nodeId, armId, seat.arm.generation);
     if (again) {
       // An operator's hold applied since the claim wins: the batch isn't handed out again, and since its first answer
-      // may have reached the waiter, it isn't requeued either.
+      // may have reached the waiter, it isn't requeued either. Nor is a batch whose text says a row is claimed for the
+      // seat once that claim is gone (unclaimed, or claimed by hand since).
       const heldNow = again.rows.filter((r) => r.admission && this.deps.holds?.(nodeId, r.admission));
-      if (!heldNow.length) return { action: "deliver", batchId: again.batchId, messages: again.messages };
-      this.markUncertain(nodeId, again.sessionName, again.rows.map((r) => r.outboxId),
-        "the seat's typing guard held it after its waiter took it; it may or may not have reached the seat, and the bridge doesn't resend it");
+      const claimGone = again.rows.some((r) => r.wakeClaimed && !this.wakeClaims?.holds(r.wake));
+      if (!heldNow.length && !claimGone) return { action: "deliver", batchId: again.batchId, messages: again.messages };
+      this.markUncertain(nodeId, again.sessionName, again.rows.map((r) => r.outboxId), heldNow.length
+        ? "the seat's typing guard held it after its waiter took it; it may or may not have reached the seat, and the bridge doesn't resend it"
+        : "the claim its wake made was undone after its waiter took it; it may or may not have reached the seat, and the bridge doesn't resend it");
       return { action: "wait" };
     }
     if (seat.turn !== "idle") return { action: "wait" };
@@ -448,31 +462,115 @@ export class HookBridge {
     const claimedAt = new Date(this.now()).toISOString();
     const claim = this.db.prepare(`UPDATE outbox_entries SET guard_delivery = json_set(guard_delivery, '$.state', 'claimed', '$.armId', ?, '$.batchId', ?,
       '$.hookEvent', ?, '$.claimedAt', ?) WHERE outbox_id = ? AND delivery_state = 'sending' AND json_extract(guard_delivery, '$.state') = 'queued'`);
-    const messages: HookBridgeMessage[] = [];
+    const omit = this.db.prepare("UPDATE outbox_entries SET guard_delivery = json_set(guard_delivery, '$.bodyOmitted', json('true')) WHERE outbox_id = ?");
+    // A queue wake whose text says its row is claimed for the seat claims it here, before the batch is handed over (the
+    // hook prints what it gets before any ack); a claim that's refused rolls back that one row's take.
+    const wakeClaimed = this.db.prepare("UPDATE outbox_entries SET guard_delivery = json_set(guard_delivery, '$.wakeClaimed', json('true')) WHERE outbox_id = ?");
+    const take = this.db.transaction((m: QueuedRow, omitted: boolean): { notify: (() => boolean) | null } | null => {
+      if (claim.run(armId, batchId, seat.arm!.hookEvent, claimedAt, m.outboxId).changes !== 1) return null;
+      if (omitted) omit.run(m.outboxId);
+      const notify = !omitted && m.automatic && m.auditPointer ? this.wakeClaims?.claim({ outboxId: m.outboxId, auditPointer: m.auditPointer, destinationSession: m.sessionName }, m.sessionName) ?? null : null;
+      if (notify) wakeClaimed.run(m.outboxId);
+      return { notify };
+    });
+    const taken: Array<{ row: QueuedRow; message: HookBridgeMessage }> = [];
+    const notices: Array<{ row: QueuedRow; notify: () => boolean }> = [];
+    const refused: Array<{ row: QueuedRow; reason: string }> = [];
+    // One body per batch: the first queue wake that carries one keeps it; a later one goes named, its body not included,
+    // and its claim stays manual.
+    let bodyCarried = false;
     this.db.transaction(() => {
       for (const m of deliverable) {
-        if (claim.run(armId, batchId, seat.arm!.hookEvent, claimedAt, m.outboxId).changes !== 1) break;
-        messages.push({ outboxId: m.outboxId, text: m.body, senderSession: m.senderSession });
+        const without = m.auditPointer ? withoutQueueWakeBody(m.body, m.auditPointer) : m.body;
+        const omitted = bodyCarried && without !== m.body;
+        let got: ReturnType<typeof take>;
+        try { got = take(m, omitted); } catch (error) {
+          refused.push({ row: m, reason: `its row couldn't be claimed for the seat (${error instanceof Error ? error.message : String(error)})` });
+          continue;
+        }
+        if (!got) break;
+        if (without !== m.body) bodyCarried = true;
+        taken.push({ row: m, message: { outboxId: m.outboxId, text: omitted ? without : m.body, senderSession: m.senderSession } });
+        if (got.notify) notices.push({ row: m, notify: got.notify });
       }
     })();
+    for (const r of refused) this.abandon(nodeId, r.row.sessionName, r.row.outboxId, r.reason);
+    // Subscribers hear of a claim once the batch has committed. A row one moved on at once doesn't get its claimed text.
+    const gone = new Set<string>();
+    for (const { row, notify } of notices) {
+      if (notify()) continue;
+      gone.add(row.outboxId);
+      this.abandon(nodeId, row.sessionName, row.outboxId, "its row moved on as the wake claimed it", "claimed");
+    }
+    // What was done meanwhile (by those subscribers) may have changed the seat or its rows, so the batch goes out only as
+    // far as the poll's own checks still pass. A wake that no longer applies (its body erased, say) ends not delivered;
+    // from the first row the seat holds now (the drain, its opt-out, another occupant, its typing guard) the rest go back
+    // to the queue untaken. Nothing of either reached the seat, so a claim their wakes made is given back.
+    const generation = seat.arm?.generation ?? null;
+    let holding = seat.arm?.armId !== armId || seat.turn !== "idle";
+    const messages: HookBridgeMessage[] = [];
+    const back: string[] = [];
+    for (const { row, message } of taken) {
+      if (gone.has(row.outboxId)) continue;
+      if (!holding && this.superseded(row)) {
+        const reason = "the queue wake no longer applies: its row was claimed, closed, erased or moved on";
+        const claimed = this.claimedByWake([row.outboxId]);
+        if (this.abandon(nodeId, row.sessionName, row.outboxId, reason, "claimed")) this.giveBack(claimed, reason);
+        continue;
+      }
+      holding ||= this.drainHolds(row) || this.undeliverable(nodeId, row, generation) !== null;
+      if (holding) back.push(row.outboxId); else messages.push(message);
+    }
+    if (back.length) this.untake(back, "the seat held it after the poll took it, before the batch was handed over");
     return messages.length ? { action: "deliver", batchId, messages } : { action: "wait" };
+  }
+
+  /** Messages a poll took but didn't hand over go back to the queue as they were, untaken; nothing of them reached the
+   *  seat, so a claim their wakes made is given back. */
+  private untake(outboxIds: string[], reason: string): void {
+    const back = this.db.prepare(`UPDATE outbox_entries SET guard_delivery = json_set(json_remove(guard_delivery, '$.armId', '$.batchId',
+        '$.hookEvent', '$.claimedAt', '$.bodyOmitted', '$.wakeClaimed'), '$.state', 'queued')
+      WHERE outbox_id = ? AND delivery_state = 'sending' AND json_extract(guard_delivery, '$.channel') = ? AND json_extract(guard_delivery, '$.state') = 'claimed'`);
+    const claimed = this.claimedByWake(outboxIds);
+    const untaken = this.db.transaction(() => outboxIds.filter((id) => back.run(id, HOOK_BRIDGE_CHANNEL).changes === 1))();
+    this.giveBack(claimed.filter((wake) => untaken.includes(wake.outboxId)), reason);
+  }
+
+  /** Of these messages, the queue wakes that claimed their rows when the poll took them. */
+  private claimedByWake(outboxIds: string[]): QueueWakeFacts[] {
+    const read = this.db.prepare(`SELECT outbox_id, audit_pointer, destination_session FROM outbox_entries WHERE outbox_id = ?
+      AND json_extract(guard_delivery, '$.wakeClaimed') = 1`);
+    return outboxIds.flatMap((id) => {
+      const row = read.get(id) as { outbox_id: string; audit_pointer: string | null; destination_session: string } | undefined;
+      return row ? [{ outboxId: row.outbox_id, auditPointer: row.audit_pointer, destinationSession: row.destination_session }] : [];
+    });
+  }
+
+  /** Gives back the claims these wakes made, since their text didn't reach the seat. */
+  private giveBack(wakes: QueueWakeFacts[], reason: string): void {
+    for (const wake of wakes) this.wakeClaims?.giveBack(wake, reason);
   }
 
   /** The batch this seat's arm claimed for this occupant and hasn't acked, oldest first, or null. Scoped to the seat and
    *  occupant, so another seat naming the same arm id never gets it. */
   private claimedBy(nodeId: string, armId: string, generation: string | null): { batchId: string; sessionName: string; messages: HookBridgeMessage[];
-    rows: Array<{ outboxId: string; admission: HookBridgeAdmission | null }> } | null {
-    const rows = this.db.prepare(`SELECT outbox_id, body, sender_session, destination_session, guard_delivery, json_extract(guard_delivery, '$.batchId') AS batch_id FROM outbox_entries
+    rows: Array<{ outboxId: string; admission: HookBridgeAdmission | null; wakeClaimed: boolean; wake: QueueWakeFacts }> } | null {
+    const rows = this.db.prepare(`SELECT outbox_id, body, sender_session, destination_session, audit_pointer, guard_delivery, json_extract(guard_delivery, '$.batchId') AS batch_id FROM outbox_entries
       WHERE delivery_state = 'sending' AND json_extract(guard_delivery, '$.channel') = ? AND json_extract(guard_delivery, '$.state') = 'claimed'
         AND json_extract(guard_delivery, '$.armId') = ? AND json_extract(guard_binding, '$.nodeId') = ? AND json_extract(guard_binding, '$.occupant') IS ?
       ORDER BY ts_dispatched, rowid`).all(HOOK_BRIDGE_CHANNEL, armId, nodeId, generation) as Array<{ outbox_id: string; body: string; sender_session: string;
-        destination_session: string; guard_delivery: string; batch_id: string }>;
+        destination_session: string; audit_pointer: string | null; guard_delivery: string; batch_id: string }>;
     if (!rows.length) return null;
     const batchId = rows[0]!.batch_id;
     const batch = rows.filter((r) => r.batch_id === batchId);
     return { batchId, sessionName: batch[0]!.destination_session,
-      messages: batch.map((r) => ({ outboxId: r.outbox_id, text: r.body, senderSession: r.sender_session })),
-      rows: batch.map((r) => ({ outboxId: r.outbox_id, admission: (JSON.parse(r.guard_delivery) as BridgeReceipt).admission ?? null })) };
+      messages: batch.map((r) => ({ outboxId: r.outbox_id, senderSession: r.sender_session,
+        text: (JSON.parse(r.guard_delivery) as BridgeReceipt).bodyOmitted && r.audit_pointer ? withoutQueueWakeBody(r.body, r.audit_pointer) : r.body })),
+      rows: batch.map((r) => {
+        const receipt = JSON.parse(r.guard_delivery) as BridgeReceipt;
+        return { outboxId: r.outbox_id, admission: receipt.admission ?? null, wakeClaimed: receipt.wakeClaimed === true,
+          wake: { outboxId: r.outbox_id, auditPointer: r.audit_pointer, destinationSession: r.destination_session } };
+      }) };
   }
 
   /** A waiter's poll, under the seat's delivery lease: it can't take a message while a typed send to the seat is under
@@ -480,7 +578,17 @@ export class HookBridge {
   pollUnderLease<R>(nodeId: string, armId: string, authorize?: () => R | null): Promise<ReturnType<HookBridge["poll"]> | { refused: R }> {
     // The caller's checks (its grant, the seat's occupant) are run again once the lease is held, right before the claim,
     // with nothing awaited in between: a poll that waited can't claim on authority it lost meanwhile.
-    const claim = () => { const refused = authorize?.() ?? null; return refused !== null ? { refused } : this.poll(nodeId, armId); };
+    // A wake's claim in the poll tells its subscribers, who may change the seat: what was taken is handed out only if the
+    // checks still pass, else it goes back to the queue untaken, as if refused before the poll.
+    const claim = () => {
+      const refused = authorize?.() ?? null;
+      if (refused !== null) return { refused };
+      const polled = this.poll(nodeId, armId);
+      const after = polled.action === "deliver" ? authorize?.() ?? null : null;
+      if (after === null) return polled;
+      if (polled.action === "deliver") this.untake(polled.messages.map((m) => m.outboxId), "the waiter's checks failed after the poll took it, before the batch was handed over");
+      return { refused: after };
+    };
     return this.deps.lease ? this.deps.lease(nodeId, claim) : Promise.resolve(claim());
   }
 

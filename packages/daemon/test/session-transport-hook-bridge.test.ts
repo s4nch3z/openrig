@@ -18,6 +18,7 @@ import { HOOK_BRIDGE_LIVE_BOUND_MS, HOOK_BRIDGE_TURN_BOUND_MS, HookBridge } from
 import { TmuxAdapter } from "../src/adapters/tmux.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
+import { CLAIMED_BY_WAKE_LINE } from "../src/domain/queue-nudge-text.js";
 import { makeWatchdogDeliver } from "../src/domain/watchdog-delivery.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
 
@@ -562,6 +563,126 @@ describe("the transport's hook-bridge branch (slice 13)", () => {
     expect(s.bridge.poll(s.nodeId, armId)).toEqual({ action: "wait" });
     expect(state(s, wake.id)).toBe("failed");
     expect(s.bridge.status(s.nodeId, s.occupant).notDelivered.outboxIds).toEqual([wake.id]);
+  });
+
+  // Claim on wake and the one-body rule, at the bridge.
+  const wakeFor = async (s: Awaited<ReturnType<typeof seat>>, repo: QueueRepository, body: string, extra: { claimOnWake?: boolean; expiresAt?: string } = {}) => {
+    const row = await repo.create({ sourceSession: "planner@team", destinationSession: s.sessionName, body, ...extra });
+    await vi.waitFor(() => expect(repo.getById(row.qitemId)?.lastNudgeResult).toBe("bridged:queued"));
+    return { qitemId: row.qitemId, id: `wake-intent-${row.qitemId}` };
+  };
+  const notes = (s: Awaited<ReturnType<typeof seat>>, qitemId: string) =>
+    (s.db.prepare("SELECT transition_note FROM queue_transitions WHERE qitem_id = ? ORDER BY transition_id").all(qitemId) as Array<{ transition_note: string }>).map((t) => t.transition_note);
+  type Delivered = { action: string; batchId: string; messages: Array<{ outboxId: string; text: string }> };
+
+  it("claims an opted-in wake's row inside the poll, before the batch is handed over; a replay doesn't claim again", async () => {
+    const s = await seat();
+    const { armId } = s.optInAndArm();
+    const repo = queueOn(s);
+    const wake = await wakeFor(s, repo, "BRIDGE-CLAIM", { claimOnWake: true });
+    expect(repo.getById(wake.qitemId)?.state).toBe("pending");
+    const polled = s.bridge.poll(s.nodeId, armId) as Delivered;
+    expect(polled.messages.map((m) => m.outboxId)).toEqual([wake.id]);
+    expect(polled.messages[0]!.text).toContain(CLAIMED_BY_WAKE_LINE);
+    expect(polled.messages[0]!.text).toContain("BRIDGE-CLAIM");
+    expect(repo.getById(wake.qitemId)).toMatchObject({ state: "in-progress", claimWakeOutboxId: wake.id });
+    // Its answer may have been lost: the waiter gets the same batch again, and the row isn't claimed twice.
+    expect(s.bridge.poll(s.nodeId, armId)).toEqual(polled);
+    expect(notes(s, wake.qitemId)).toEqual(["created", "claimed"]);
+    s.bridge.ack(s.nodeId, s.sessionName, s.occupant, armId, polled.batchId);
+    expect(state(s, wake.id)).toBe("delivered");
+    expect(s.writes).toEqual([]);
+  });
+
+  it("carries one body per batch: the first wake's; the next is named, its body not included, also on a replay", async () => {
+    const s = await seat();
+    const { armId } = s.optInAndArm();
+    const repo = queueOn(s);
+    const first = await wakeFor(s, repo, "BODY-ONE", { claimOnWake: true });
+    const second = await wakeFor(s, repo, "BODY-TWO", { claimOnWake: true });
+    const polled = s.bridge.poll(s.nodeId, armId) as Delivered;
+    expect(polled.messages.map((m) => m.outboxId)).toEqual([first.id, second.id]);
+    expect(polled.messages[0]!.text).toContain("BODY-ONE");
+    expect(polled.messages[1]!.text).not.toContain("BODY-TWO");
+    expect(polled.messages[1]!.text).toContain(`not included in this delivery; read it with rig queue show '${second.qitemId}' --full`);
+    expect(polled.messages[1]!.text).toContain(`Claim: required — rig queue claim '${second.qitemId}'`);
+    expect([repo.getById(first.qitemId)?.state, repo.getById(second.qitemId)?.state]).toEqual(["in-progress", "pending"]);
+    expect(s.bridge.poll(s.nodeId, armId)).toEqual(polled);
+  });
+
+  it("ends a wake whose claim is refused (its row expired) not delivered, and the next wake carries its body", async () => {
+    const s = await seat();
+    const { armId } = s.optInAndArm();
+    const repo = queueOn(s);
+    const late = await wakeFor(s, repo, "LATE", { claimOnWake: true, expiresAt: new Date(Date.now() - 60_000).toISOString() });
+    const next = await wakeFor(s, repo, "NEXT", { claimOnWake: true });
+    const polled = s.bridge.poll(s.nodeId, armId) as Delivered;
+    expect(polled.messages.map((m) => m.outboxId)).toEqual([next.id]);
+    expect(polled.messages[0]!.text).toContain("NEXT");
+    expect(state(s, late.id)).toBe("failed");
+    expect(repo.getById(late.qitemId)?.state).toBe("pending");
+    expect(repo.getById(next.qitemId)?.state).toBe("in-progress");
+  });
+
+  it("doesn't hand over a claimed wake whose row a claim subscriber moved on at once: it ends not delivered", async () => {
+    const s = await seat();
+    const { armId } = s.optInAndArm();
+    const bus = new EventBus(s.db);
+    const repo = new QueueRepository(s.db, bus, { validateRig: () => true });
+    repo.attachTransport(s.transport as never);
+    repo.attachOutbox(new OutboxHandler(s.db));
+    const wake = await wakeFor(s, repo, "CANCEL-AT-CLAIM", { claimOnWake: true });
+    bus.subscribe((event) => {
+      if (event.type === "queue.claimed") repo.update({ qitemId: event.qitemId, actorSession: "planner@team", state: "canceled", transitionNote: "no longer wanted" });
+    });
+    expect(s.bridge.poll(s.nodeId, armId)).toEqual({ action: "wait" });
+    expect(state(s, wake.id)).toBe("failed");
+    expect(repo.getById(wake.qitemId)?.state).toBe("canceled");
+  });
+
+  const busOn = (s: Awaited<ReturnType<typeof seat>>) => {
+    const bus = new EventBus(s.db);
+    const repo = new QueueRepository(s.db, bus, { validateRig: () => true });
+    repo.attachTransport(s.transport as never);
+    repo.attachOutbox(new OutboxHandler(s.db));
+    return { bus, repo };
+  };
+
+  it("puts the batch back when a claim subscriber holds the seat (its drain here), gives the claim back, and claims it again when it goes", async () => {
+    const s = await seat();
+    const { armId } = s.optInAndArm();
+    const { bus, repo } = busOn(s);
+    const wake = await wakeFor(s, repo, "HELD-AT-CLAIM", { claimOnWake: true });
+    let draining = false, holdOnce = true;
+    s.drainWith(() => draining);
+    bus.subscribe((event) => { if (event.type === "queue.claimed" && holdOnce) { holdOnce = false; draining = true; } });
+    expect(s.bridge.poll(s.nodeId, armId)).toEqual({ action: "wait" });
+    expect(state(s, wake.id)).toBe("sending");
+    expect(repo.getById(wake.qitemId)).toMatchObject({ state: "pending" });
+    expect(repo.getById(wake.qitemId)?.claimWakeOutboxId ?? null).toBeNull();
+    draining = false;
+    const polled = s.bridge.poll(s.nodeId, armId) as Delivered;
+    expect(polled.messages.map((m) => m.outboxId)).toEqual([wake.id]);
+    expect(polled.messages[0]!.text).toContain("HELD-AT-CLAIM");
+    expect(repo.getById(wake.qitemId)).toMatchObject({ state: "in-progress", claimWakeOutboxId: wake.id });
+    expect(notes(s, wake.qitemId)).toEqual(["created", "claimed",
+      "unclaimed: the seat held it after the poll took it, before the batch was handed over", "claimed"]);
+  });
+
+  it("doesn't hand over a wake whose row a claim subscriber erased: it ends not delivered and its claim is given back", async () => {
+    const s = await seat();
+    const { armId } = s.optInAndArm();
+    const { bus, repo } = busOn(s);
+    const wake = await wakeFor(s, repo, "ERASED-AT-CLAIM", { claimOnWake: true });
+    // What a committed scrub leaves: the row's content erased and the wake's stored copy emptied.
+    bus.subscribe((event) => {
+      if (event.type !== "queue.claimed") return;
+      s.db.prepare("UPDATE queue_items SET body = '', content_erased_at = ? WHERE qitem_id = ?").run(new Date().toISOString(), wake.qitemId);
+      s.db.prepare("UPDATE outbox_entries SET body = '' WHERE audit_pointer = ?").run(wake.qitemId);
+    });
+    expect(s.bridge.poll(s.nodeId, armId)).toEqual({ action: "wait" });
+    expect(state(s, wake.id)).toBe("failed");
+    expect(repo.getById(wake.qitemId)).toMatchObject({ state: "pending" });
   });
 
   it("doesn't queue a send whose caller cancelled it while it waited for the seat's lease (R7-4)", async () => {

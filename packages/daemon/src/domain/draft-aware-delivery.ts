@@ -15,6 +15,16 @@ interface Receipt { inputRoute?: "typed"; ids: string[]; result?: SendResult; ex
 type Deliver = (session: string, text: string, opts: SendOpts) => Promise<SendResult>;
 /** Applicability needs the intended queue row and recipient, not a saved delivery receipt. */
 export type QueueWakeFacts = Pick<OutboxEntry, "outboxId" | "auditPointer" | "destinationSession">;
+/** Claim on wake (QueueRepository), for a wake whose text says its row is claimed for the seat. `claim` claims the row
+ *  just before that text is handed over, or throws; null when there was nothing to claim, else the claim's notification,
+ *  sent after the caller's outermost commit, true while the claim holds. `holds`: whether the claim this wake made still
+ *  does. `giveBack`: the wake's text wasn't handed over after all, so its claim is undone while it's still the row's
+ *  newest transition. */
+export interface WakeClaims {
+  claim(entry: QueueWakeFacts, recipient: string): (() => boolean) | null;
+  holds(entry: QueueWakeFacts): boolean;
+  giveBack(entry: QueueWakeFacts, reason: string): void;
+}
 
 export class DraftAwareDelivery {
   private readonly outbox: OutboxHandler;

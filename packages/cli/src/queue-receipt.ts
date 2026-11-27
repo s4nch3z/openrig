@@ -58,7 +58,7 @@ const STARTS_WAKE: ReadonlySet<WriteVerb> = new Set(["create", "handoff", "hando
  *  the rest appear only when the row has a value. */
 const ALWAYS = ["qitemId", "state", "destinationSession", "sourceSession", "tsCreated", "tsUpdated", "priority", "summary",
   "tags", "pickup", "lastNudgeResult", "lastNudgeAttempt"] as const;
-const WHEN_SET = ["tier", "blockedOn", "closureReason", "closureTarget", "closureRequiredAt", "claimedAt", "handedOffTo",
+const WHEN_SET = ["tier", "blockedOn", "closureReason", "closureTarget", "closureRequiredAt", "claimedAt", "claimWakeOutboxId", "handedOffTo",
   "handedOffFrom", "targetRepo", "expiresAt", "advisories", "handoffAdvisory", "createWarning", "persisted", "delivery"] as const;
 const SHOWN_WAITING = ["blocker", "nextBackstop"] as const;
 const ROW_KEYS_CONSUMED_ELSEWHERE = new Set<string>(["body", "waiting"]);
@@ -162,7 +162,7 @@ function rowLines(heading: string, r: Row): string[] {
     typeof r.bodyBytes === "number" ? `body ${r.bodyBytes.toLocaleString("en-US")} bytes` : "body size not in the response",
     `from ${String(r.sourceSession)}`];
   if (r.priority && r.priority !== "routine") facts.push(`priority ${String(r.priority)}`);
-  if (r.claimedAt) facts.push(`claimed ${String(r.claimedAt)}`);
+  if (r.claimedAt) facts.push(`${r.claimWakeOutboxId ? "claimed by its wake" : "claimed"} ${String(r.claimedAt)}`);
   if (r.closureRequiredAt) facts.push(`close by ${String(r.closureRequiredAt)}`);
   if (r.tier) facts.push(`tier ${String(r.tier)}`);
   if (r.targetRepo) facts.push(`repo ${String(r.targetRepo)}`);
