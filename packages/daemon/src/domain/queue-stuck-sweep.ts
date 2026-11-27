@@ -565,7 +565,11 @@ function deliveryResolutionEvidence(
   // separate notification owed to a person while that agent is waiting on them.
   if (kind !== "undelivered-human-notice") {
     if (deps.queueRepo.isLocalHumanDecisionWithoutGateway(row)) return "local kernel decision remains on the attention feed; no gateway wake is configured";
-    if (row.claimedAt) return row.claimWakeOutboxId ? `source claimed by its wake at ${row.claimedAt}, not by the seat` : `source claimed at ${row.claimedAt}`;
+    // A wake's own claim is the daemon's, made before its text was written: it says nothing about whether that text
+    // reached the seat, so it doesn't resolve a failed wake.
+    if (row.claimedAt && !(row.claimWakeOutboxId && kind === "undelivered-wake")) {
+      return row.claimWakeOutboxId ? `source claimed by its wake at ${row.claimedAt}, not by the seat` : `source claimed at ${row.claimedAt}`;
+    }
     if (row.state === "blocked") return "source parked";
     if (kind === "undelivered-wake") {
       const wake = readWakeOutcome(row.lastNudgeResult);
