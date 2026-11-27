@@ -1562,6 +1562,20 @@ describe("S02 standing stuck sweep — both halves, routed findings, quiet-but-o
     expect(resolution).toContain(`source claimed by its wake at ${repo.getById(row.qitemId)!.claimedAt}, not by the seat`);
   });
 
+  it.each([false, true])("a wake-origin claim alone isn't resolution evidence for a failed delivery (manual claim=%s)", async manual => {
+    const row = await repo.create({ sourceSession: "sender@r", destinationSession: "worker@r", body: "work", claimOnWake: true });
+    failNudge(row.qitemId);
+    await runSweep();
+    const [finding] = await findingsFor(row.qitemId);
+    expect(finding).toBeDefined();
+    expect(finding!.tags).toContain(`stuck-sweep:undelivered-wake:${row.qitemId}`);
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r",
+      ...(!manual ? { wakeOutboxId: `wake-intent-${row.qitemId}` } : {}) });
+    expect(repo.getById(row.qitemId)!.lastNudgeWireResult).toContain("failed:");
+    await runSweep();
+    expect(repo.getById(finding!.qitemId)!.state).toBe(manual ? "done" : "pending");
+  });
+
   it("#1419 RESOLUTION BEATS SUPPRESSION: a fresh marker does not keep a finding open after the source is completed", async () => {
     const mod = await sweepMod();
     const row = await mkRow();
