@@ -16,7 +16,8 @@ import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { eraseQueue } from "../src/domain/queue-erasure.js";
 
 async function heldSeat(onErase?: (seat: { rootPid: number; screen: string }) => void,
-  aroundPaste?: { onPaste: (seat: { rootPid: number; screen: string }) => void; unknownBeforePaste?: boolean }) {
+  aroundPaste?: { onPaste: (seat: { rootPid: number; screen: string }) => void; unknownBeforePaste?: boolean;
+    effect?: "throw-before-enter" | "enter-answer-lost" }) {
   const db = new Database(":memory:"); migrate(db, ALL_MIGRATIONS);
   db.exec(`INSERT INTO rigs(id,name) VALUES ('r','test');
     INSERT INTO nodes(id,rig_id,logical_id,runtime) VALUES ('a','r','worker','claude-code');
@@ -40,7 +41,10 @@ async function heldSeat(onErase?: (seat: { rootPid: number; screen: string }) =>
         seat.pasted.push(seat.loaded); seat.screen += seat.loaded;
         if (aroundPaste && !pasteChanged) { pasteChanged = true; aroundPaste.onPaste(seat); }
       }
-      if (line.includes("send-keys") && line.includes("Enter")) seat.submitted.push(seat.screen);
+      if (line.includes("send-keys") && line.includes("Enter")) {
+        seat.submitted.push(seat.screen);
+        if (aroundPaste?.effect === "enter-answer-lost") throw new Error("Enter handed over; executor answer lost");
+      }
       return line.includes("capture-pane") ? seat.screen : "";
     });
     tmux.deliveryGuard = new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name));
@@ -52,6 +56,8 @@ async function heldSeat(onErase?: (seat: { rootPid: number; screen: string }) =>
     vi.spyOn(tmux, "getPaneCursorPosition").mockImplementation(async () => seat.cursor);
     return new SessionTransport({ db, tmuxAdapter: tmux, rigRepo: new RigRepository(db), sessionRegistry: new SessionRegistry(db),
       sleep: async ms => {
+        if (ms === 200 && aroundPaste?.effect === "throw-before-enter") throw new Error("post-paste wait failed before Enter");
+        if (aroundPaste?.effect === "enter-answer-lost") return;
         if (ms !== 200 || !eraseId) return;
         await eraseQueue(db, { scope: { kind: "ids", entries: [{ qitemId: eraseId, action: "scrub" }] }, apply: true, nowIso: new Date().toISOString() });
         eraseId = null;
@@ -197,6 +203,29 @@ describe("known refused own-wake residue belongs to its physical input", () => {
       expect.soft(back).toMatchObject({ ok: false, sent: false, inputPhase: "not_reached" });
       expect.soft(f.seat.screen).toBe(originalInput);
       expect.soft(f.seat.submitted).toEqual([]);
+    } finally { f.db.close(); vi.restoreAllMocks(); }
+  });
+
+  it("a generic failure after the queue wake paste and before Enter keeps the known residue held", async () => {
+    const f = await heldSeat(undefined, { onPaste: () => {}, effect: "throw-before-enter" });
+    try {
+      expect(f.wakeResult).toMatchObject({ ok: false, inputPhase: "written" });
+      expect(f.seat.pasted).toHaveLength(1);
+      expect(f.seat.submitted).toEqual([]);
+      expect(f.holds()).toHaveLength(1);
+      expect(await f.daemon().send("worker@test", "FOLLOWUP")).toMatchObject({ ok: false, sent: false, inputPhase: "not_reached" });
+      expect(f.seat.pasted).toHaveLength(1);
+      expect(f.seat.submitted).toEqual([]);
+    } finally { f.db.close(); vi.restoreAllMocks(); }
+  });
+
+  it("a possibly sent Enter stays uncertain and isn't reclassified as unsubmitted residue", async () => {
+    const f = await heldSeat(undefined, { onPaste: () => {}, effect: "enter-answer-lost" });
+    try {
+      expect(f.wakeResult).toMatchObject({ ok: false, inputPhase: "written", reason: "submit_failed" });
+      expect(f.seat.submitted).toHaveLength(1); // executor saw Enter before losing its answer
+      expect(f.seat.submitted[0]).toContain("BODY-ERASED-BEFORE-ENTER");
+      expect(f.holds()).toEqual([]);
     } finally { f.db.close(); vi.restoreAllMocks(); }
   });
 });
