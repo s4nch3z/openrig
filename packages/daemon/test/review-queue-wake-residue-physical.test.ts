@@ -200,4 +200,3 @@ describe("known refused own-wake residue belongs to its physical input", () => {
     } finally { f.db.close(); vi.restoreAllMocks(); }
   });
 });
-
