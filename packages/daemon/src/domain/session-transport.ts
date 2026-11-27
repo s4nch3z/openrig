@@ -2483,12 +2483,18 @@ export class SessionTransport {
   }
 
   /** A queue wake's text was pasted, then its Enter refused because the wake no longer applied: the text may stay in the
-   *  seat's input. Only the input it went into (pane and pane process) is kept, never the text, and erasure doesn't clear it. */
-  private async holdInputResidue(sessionName: string, meta: { nodeId: string | null; pane: string | null; occupant: string | null }, readTarget: string, opts: SendOpts | undefined): Promise<void> {
-    if (!meta.nodeId || !hasResidueTable(this.db)) return;
-    const pid = await this.tmuxAdapter.getPanePid(readTarget).catch(() => null);
-    this.db.prepare("INSERT OR REPLACE INTO seat_input_residue (node_id, session_name, pane, pane_pid, occupant, outbox_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(meta.nodeId, sessionName, meta.pane, pid, meta.occupant, opts?.committedOutboxIds?.[0] ?? opts?.deliveryId ?? null, this.now().toISOString());
+   *  input of the pane process that received it. One hold per such process (each one read around the paste; unknown when
+   *  neither was read), keeping where it went, never the text; erasure doesn't clear it. */
+  private async holdInputResidue(sessionName: string, meta: { nodeId: string | null; pane: string | null; occupant: string | null }, receivers: Array<number | null> | null, opts: SendOpts | undefined): Promise<void> {
+    if (!meta.nodeId || !receivers) return;
+    const known = [...new Set(receivers.filter((pid): pid is number => pid !== null))];
+    this.db.transaction(() => {
+      for (const pid of known.length > 0 ? known : [null]) {
+        this.db.prepare("DELETE FROM seat_input_residue WHERE node_id = ? AND pane_pid IS ?").run(meta.nodeId, pid);
+        this.db.prepare("INSERT INTO seat_input_residue (node_id, session_name, pane, pane_pid, occupant, outbox_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+          .run(meta.nodeId, sessionName, meta.pane, pid, meta.occupant, opts?.committedOutboxIds?.[0] ?? opts?.deliveryId ?? null, this.now().toISOString());
+      }
+    })();
   }
 
   /** Before an automatic send's first input: while that text may be in the input, nothing is written onto it, so no
@@ -2498,14 +2504,14 @@ export class SessionTransport {
   private async inputResidueHold(sessionName: string, meta: { nodeId: string | null; runtime: string | null },
     readTarget: string, opts: SendOpts | undefined): Promise<{ result: SendResult; held: InputBoxAnnotation | null } | null> {
     if (!meta.nodeId || opts?.dangerouslyInteract || !hasResidueTable(this.db)) return null;
-    const hold = this.db.prepare("SELECT pane_pid FROM seat_input_residue WHERE node_id = ?").get(meta.nodeId) as { pane_pid: number | null } | undefined;
-    if (!hold) return null;
-    const pid = hold.pane_pid === null ? null : await this.tmuxAdapter.getPanePid(readTarget).catch(() => null);
-    if (pid !== null && pid !== hold.pane_pid) return null;
+    const holds = this.db.prepare("SELECT pane_pid FROM seat_input_residue WHERE node_id = ?").all(meta.nodeId) as Array<{ pane_pid: number | null }>;
+    if (holds.length === 0) return null;
+    const pid = holds.some(hold => hold.pane_pid !== null) ? await this.tmuxAdapter.getPanePid(readTarget).catch(() => null) : null;
+    if (pid !== null && !holds.some(hold => hold.pane_pid === null || hold.pane_pid === pid)) return null;
     const runtime = meta.runtime === "claude-code" || meta.runtime === "codex" ? meta.runtime : null;
     const box = runtime ? await this.captureInputBox(readTarget, runtime, { remainingMs: INPUT_BOX_READ_DEADLINE_MS }) : null;
     if (box?.status === "empty" || (box?.status === "likely-suggestion" && box.confidence === "high")) {
-      if (pid !== null) this.db.prepare("DELETE FROM seat_input_residue WHERE node_id = ?").run(meta.nodeId);
+      if (pid !== null) this.db.prepare("DELETE FROM seat_input_residue WHERE node_id = ? AND pane_pid = ?").run(meta.nodeId, pid);
       return null;
     }
     const readable = box?.status === "typed" || box?.status === "typed-with-suggestion";
@@ -4177,6 +4183,9 @@ export class SessionTransport {
       }
       if (!clear) pastedOverInputBox = box?.status ?? "unknown";
     } : undefined;
+    // A queue wake's receiving pane process, read just before and just after its paste: a refusal before Enter holds
+    // each process that may have received it, not one observed later.
+    const receivers = opts?.queueWake && hasResidueTable(this.db) ? [await this.tmuxAdapter.getPanePid(readTarget).catch(() => null)] : null;
     // Set once the text write has been handed to the adapter: from then on a throw is not "nothing sent".
     let writeIssued = false;
     const tagIssued = (error: unknown): never => {
@@ -4218,6 +4227,7 @@ export class SessionTransport {
       });
     }
     try { opts?.onInputEffect?.("pasted", { text }); } catch { /* Observation cannot change a completed paste. */ }
+    if (receivers) receivers.push(await this.tmuxAdapter.getPanePid(readTarget).catch(() => null));
 
     // From the successful paste to Enter the text may sit in the seat's input. Any throw in this span is
     // tagged inputWritten, so no caller reports it as unsent; a step added here later stays covered.
@@ -4273,7 +4283,7 @@ export class SessionTransport {
       );
       if (!submitResult.ok) {
         const policyRefusal = typeof submitResult.code === "string" && (submitResult.code.startsWith("expected_identity_") || submitResult.code.startsWith("draft_") || submitResult.code === "managed_compaction_pending");
-        if (submitResult.code === "draft_wake_superseded") await this.holdInputResidue(sessionName, sessionMeta, readTarget, opts);
+        if (submitResult.code === "draft_wake_superseded") await this.holdInputResidue(sessionName, sessionMeta, receivers, opts);
         return observe({
           ok: false,
           sessionName,
@@ -4289,7 +4299,7 @@ export class SessionTransport {
       }
     } catch (error) {
       if (error && typeof error === "object") Object.assign(error, { inputWritten: true, enterAttempted: enterIssued });
-      if (!enterIssued && error instanceof DeliveryGuardError && error.code === "draft_wake_superseded") await this.holdInputResidue(sessionName, sessionMeta, readTarget, opts);
+      if (!enterIssued && error instanceof DeliveryGuardError && error.code === "draft_wake_superseded") await this.holdInputResidue(sessionName, sessionMeta, receivers, opts);
       throw error;
     }
     try { opts?.onInputEffect?.("submitted"); } catch { /* Observation cannot change a completed submission. */ }
