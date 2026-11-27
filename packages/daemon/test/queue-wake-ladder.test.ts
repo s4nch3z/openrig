@@ -14,7 +14,7 @@
 // forgotten-ladder and reset-count are both REDs below.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import Database from "better-sqlite3";
-import { renderQueueHandoffNudge } from "../src/domain/queue-nudge-text.js";
+import { renderQueueHandoffNudge, renderQueueWakeBody } from "../src/domain/queue-nudge-text.js";
 import { migrate } from "../src/db/migrate.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { QueueRepository, type QueueItem } from "../src/domain/queue-repository.js";
@@ -1099,13 +1099,13 @@ describe("wake ladder retry — envelope sender", () => {
       swapGraceSeconds: 180,
       log: () => {},
     });
-    // The body is the default handoff nudge text, plus only the row-source suffix.
+    // The body is the default handoff nudge text, plus only the row-source suffix, then the row's body section.
     expect(maybeNudge).toHaveBeenCalledWith(
       created.qitemId,
       "worker@r",
       true,
       "daemon@kernel",
-      `${renderQueueHandoffNudge(created.qitemId, null)} Row source: relay@r.`,
+      `${renderQueueHandoffNudge(created.qitemId, null)} Row source: relay@r.\n${renderQueueWakeBody(created.qitemId, { text: created.body, erased: false })}`,
       "openrig",
     );
     db.close();

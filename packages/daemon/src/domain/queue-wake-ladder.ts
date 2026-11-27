@@ -4,7 +4,7 @@ import type { HookReviewObservation } from "./kernel-hook-review.js";
 import type { ArbitratedSeatState } from "./activity-taxonomy.js";
 import { seatRuntimeHomeBySession } from "./seat-runtime-home.js";
 import { isOpenRigSender, OPENRIG_SENDER } from "../lib/pane-envelope.js";
-import { renderQueueHandoffNudge } from "./queue-nudge-text.js";
+import { renderQueueHandoffNudge, renderQueueWakeBody } from "./queue-nudge-text.js";
 import { quietHoldCustody } from "./quiet-hold-custody.js";
 import { latestHookState, latestHookMovedOn, latestHookPermissionPending, latestHookWaitsOnPerson } from "./agent-activity-store.js";
 import { PERMISSION_REQUEST_GRACE_MS } from "./seat-activity-service.js";
@@ -61,7 +61,7 @@ import { runSyncSite } from "./sync-site-wrap.js";
 // (escalation view + daemon-health) and exhausts as before.
 
 import type Database from "better-sqlite3";
-import type { OwedNoticeCursor, QueueItem, QueueRepository } from "./queue-repository.js";
+import { wakeBody, type OwedNoticeCursor, type QueueItem, type QueueRepository } from "./queue-repository.js";
 import { deriveUsageLimitPools, type UsageLimitPool } from "./provider/provider-signals.js";
 import type { FourBlockReadModel } from "./provider/provider-types.js";
 import {
@@ -811,7 +811,7 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
         const row = deps.queueRepo.getById(qitemId);
         // The delivery ID derives from this text, so an occurrence in it makes that occurrence's own delivery.
         const bodyOverride = `${renderQueueHandoffNudge(qitemId, null)}${row?.sourceSession ? ` Row source: ${row.sourceSession}.` : ""}`
-          + `${occurrence ? ` ${occurrence}` : ""}`;
+          + `${occurrence ? ` ${occurrence}` : ""}` + (row ? `\n${renderQueueWakeBody(qitemId, wakeBody(row))}` : "");
         await deps.queueRepo.maybeNudge(qitemId, target, true, OPENRIG_SENDER, bodyOverride, "openrig");
         return deps.queueRepo.getById(qitemId)?.lastNudgeWireResult ?? "indeterminate:no transport available";
       });

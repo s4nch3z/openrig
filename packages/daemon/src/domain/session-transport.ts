@@ -77,6 +77,17 @@ export const SEND_READINESS_FRESHNESS_MS = 15_000;
 // unconfirmed, and Enter is still sent once.
 const INPUT_BOX_READ_DEADLINE_MS = 500;
 
+const residueTables = new WeakMap<Database.Database, boolean>();
+/** Whether the schema has seat_input_residue; a database without it records and holds nothing, as before. */
+function hasResidueTable(db: Database.Database): boolean {
+  let has = residueTables.get(db);
+  if (has === undefined) {
+    has = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'seat_input_residue'").get() as { name?: unknown } | undefined)?.name === "seat_input_residue";
+    residueTables.set(db, has);
+  }
+  return has;
+}
+
 // A Claude seat whose recorded pane is no longer in its tmux session. The usual cause is a seat resumed by hand in its
 // session (after a reboot, say), and `rig reconcile-session` binds the live pane, so the refusal names it.
 const STALE_BOUND_PANE = "The session does not have the expected bound pane";
@@ -2451,6 +2462,57 @@ export class SessionTransport {
     if (this.hookBridge) this.hookBridge.wakeApplicable = applicable;
   }
 
+  /** A queue wake's last check before each of its writes (the paste or the native offer, then Enter), on the routes that
+   *  don't make it themselves (the draft-aware delivery and the hook bridge do): its row still wants this wake, so a body
+   *  erased after the wake's text was rendered is never written. */
+  private wakeChecked(sessionName: string, ids: readonly string[], opts: SendOpts | undefined): SendOpts | undefined {
+    const applicable = this.queueWakeApplicable;
+    if (!opts?.queueWake || opts.drainExempt || !applicable) return opts;
+    const facts = this.queueWakeFacts(sessionName, ids, opts);
+    return { ...opts, beforeWrite: () => {
+      if (!applicable(facts)) throw new DeliveryGuardError("draft_wake_superseded", "The queue wake is no longer applicable; no further input was written.");
+      opts.beforeWrite?.();
+    } };
+  }
+
+  /** One fact per expected ID. A committed entry that's gone (deleted by erasure) names no row, so it isn't applicable. */
+  private queueWakeFacts(sessionName: string, ids: readonly string[], opts: SendOpts): QueueWakeFacts[] {
+    const outbox = new OutboxHandler(this.db);
+    return opts.committedOutboxIds ? ids.map((id) => outbox.getById(id) ?? { outboxId: id, auditPointer: null, destinationSession: sessionName })
+      : [{ outboxId: ids[0]!, auditPointer: opts.auditPointer ?? null, destinationSession: sessionName }];
+  }
+
+  /** A queue wake's text was pasted, then its Enter refused because the wake no longer applied: the text may stay in the
+   *  seat's input. Only the input it went into (pane and pane process) is kept, never the text, and erasure doesn't clear it. */
+  private async holdInputResidue(sessionName: string, meta: { nodeId: string | null; pane: string | null; occupant: string | null }, readTarget: string, opts: SendOpts | undefined): Promise<void> {
+    if (!meta.nodeId || !hasResidueTable(this.db)) return;
+    const pid = await this.tmuxAdapter.getPanePid(readTarget).catch(() => null);
+    this.db.prepare("INSERT OR REPLACE INTO seat_input_residue (node_id, session_name, pane, pane_pid, occupant, outbox_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(meta.nodeId, sessionName, meta.pane, pid, meta.occupant, opts?.committedOutboxIds?.[0] ?? opts?.deliveryId ?? null, this.now().toISOString());
+  }
+
+  /** Before an automatic send's first input: while that text may be in the input, nothing is written onto it, so no
+   *  later paste or Enter submits it. The hold belongs to the pane process the text went into: a pane label or an
+   *  occupant record proves nothing. A send to another, proven process goes ahead and the hold stays for its own input;
+   *  an input read empty takes the send; only that same process's input read empty ends the hold. */
+  private async inputResidueHold(sessionName: string, meta: { nodeId: string | null; runtime: string | null },
+    readTarget: string, opts: SendOpts | undefined): Promise<{ result: SendResult; held: InputBoxAnnotation | null } | null> {
+    if (!meta.nodeId || opts?.dangerouslyInteract || !hasResidueTable(this.db)) return null;
+    const hold = this.db.prepare("SELECT pane_pid FROM seat_input_residue WHERE node_id = ?").get(meta.nodeId) as { pane_pid: number | null } | undefined;
+    if (!hold) return null;
+    const pid = hold.pane_pid === null ? null : await this.tmuxAdapter.getPanePid(readTarget).catch(() => null);
+    if (pid !== null && pid !== hold.pane_pid) return null;
+    const runtime = meta.runtime === "claude-code" || meta.runtime === "codex" ? meta.runtime : null;
+    const box = runtime ? await this.captureInputBox(readTarget, runtime, { remainingMs: INPUT_BOX_READ_DEADLINE_MS }) : null;
+    if (box?.status === "empty" || (box?.status === "likely-suggestion" && box.confidence === "high")) {
+      if (pid !== null) this.db.prepare("DELETE FROM seat_input_residue WHERE node_id = ?").run(meta.nodeId);
+      return null;
+    }
+    const readable = box?.status === "typed" || box?.status === "typed-with-suggestion";
+    return { held: box, result: { ok: false, sessionName, sent: false, inputPhase: "not_reached", reason: readable ? "draft_input_busy" : "draft_input_unknown",
+      error: `Held: a queue wake's text was pasted into '${sessionName}', then its Enter was withheld because the wake no longer applied (its row was erased or settled), so that text may still be in the input (it reads ${box?.status ?? "unknown"}). Nothing was sent. Clear the seat's input in its terminal; the next automatic send then finds it empty and goes ahead. A send to a new pane process for the seat isn't held.` } };
+  }
+
   attachRuntimeAdapters(adapters: Record<string, TransportReadinessChecker>): void {
     this.runtimeAdapters = { ...this.runtimeAdapters, ...adapters };
   }
@@ -3159,7 +3221,7 @@ export class SessionTransport {
       }
       // No guard, so no recorded delivery to read back: a caller already gone ends the send here.
       if (callerSignal(opts)?.aborted) return callerCancelled(sessionName);
-      const result = await this.sendUnguarded(sessionName, text, opts);
+      const result = await this.sendUnguarded(sessionName, text, this.wakeChecked(sessionName, opts?.committedOutboxIds ?? (opts?.deliveryId ? [opts.deliveryId] : []), opts));
       if (result.ok && result.sent !== false) {
         await this.reconcileStartupReadiness(sessionName).catch(() => {});
       }
@@ -3236,7 +3298,7 @@ export class SessionTransport {
             original.assertCurrent();
           }
           if (callerSignal(memberOpts)?.aborted) return callerCancelled(sessionName);
-          return this.admitNative(sessionName, memberText, memberOpts, currentIds);
+          return this.admitNative(sessionName, memberText, this.wakeChecked(sessionName, currentIds, memberOpts), currentIds);
         }
         // Slice 13: an occupant launched with its hook bridge gets the message at its next turn boundary, nothing typed.
         // Admission (hold, the levels) has already decided above. With no live arm, it's typed, with a warning; messages
@@ -3255,9 +3317,7 @@ export class SessionTransport {
             if (callerSignal(memberOpts)?.aborted) return callerCancelled(sessionName);
             const bridgeIds = memberOpts?.committedOutboxIds ?? ids;
             if (memberOpts?.queueWake && !memberOpts.drainExempt && this.queueWakeApplicable) {
-              const outbox = new OutboxHandler(this.db);
-              const facts = memberOpts.committedOutboxIds ? bridgeIds.map((id) => outbox.getById(id)).filter((e): e is NonNullable<typeof e> => !!e)
-                : [{ outboxId: bridgeIds[0]!, auditPointer: memberOpts.auditPointer ?? null, destinationSession: sessionName }];
+              const facts = this.queueWakeFacts(sessionName, bridgeIds, memberOpts);
               let applicable = true;
               try { applicable = this.queueWakeApplicable(facts); } catch (error) {
                 console.error(`[hook-bridge] ${sessionName}'s queue wake couldn't be read; delivering:`, error);
@@ -3291,7 +3351,7 @@ export class SessionTransport {
           return this.guardedDelivery.send(sessionName, memberText, memberOpts ?? {},
             memberOpts?.committedOutboxIds ?? [memberOpts?.expectedIdentity && memberOpts.deliveryId ? memberOpts.deliveryId : `guard-send-${randomUUID()}`]);
         }
-        return this.sendUnguarded(sessionName, memberText, memberOpts);
+        return this.sendUnguarded(sessionName, memberText, this.wakeChecked(sessionName, currentIds, memberOpts));
       }, async target => {
         if (opts?.submitOnly) return { ok: false, sessionName, sent: false, reason: "typing_guard_enabled", error: "Typing guard prevents submit-only; no Enter was sent." };
         // Nothing is retained yet: a caller that went away while this send waited for the lease ends it here.
@@ -3729,6 +3789,8 @@ export class SessionTransport {
       if (targetFailure) return targetFailure;
       const copyModeFailure = await leavePaneMode("Nothing was submitted.");
       if (copyModeFailure) return copyModeFailure;
+      const residue = await this.inputResidueHold(sessionName, sessionMeta, readTarget, opts);
+      if (residue) return residue.result;
       if (cancel?.aborted) return callerCancelled(sessionName);
       // The last check runs in the adapter, immediately before the key (after its guard checks).
       const beforeKey = cancel ? () => { if (cancel.aborted) throw new DeliveryGuardError(CALLER_CANCELLED, "caller cancelled before the key"); } : undefined;
@@ -4054,6 +4116,15 @@ export class SessionTransport {
     if (targetFailure) return observe(targetFailure);
     const copyModeFailure = await leavePaneMode("No text was sent.");
     if (copyModeFailure) return observe({ ...copyModeFailure, ...(waitMode ? waitEvidence : {}) });
+    const residue = await this.inputResidueHold(sessionName, sessionMeta, readTarget, opts);
+    if (residue) {
+      heldInputBox = residue.held?.status ?? "unknown";
+      if (residue.held) {
+        const { status, confidence, evidence, cursor } = residue.held;
+        heldInputBoxReading = { status, confidence, evidence, cursor };
+      }
+      return observe({ ...residue.result, ...(waitMode ? waitEvidence : {}) });
+    }
 
     // transport.draft_delivery for the drafts the pane classifier misses (framed Claude composers read as idle): the
     // input-box reader sees them. Under an explicit refuse, a typed box refuses as a recognized draft does, before any
@@ -4202,6 +4273,7 @@ export class SessionTransport {
       );
       if (!submitResult.ok) {
         const policyRefusal = typeof submitResult.code === "string" && (submitResult.code.startsWith("expected_identity_") || submitResult.code.startsWith("draft_") || submitResult.code === "managed_compaction_pending");
+        if (submitResult.code === "draft_wake_superseded") await this.holdInputResidue(sessionName, sessionMeta, readTarget, opts);
         return observe({
           ok: false,
           sessionName,
@@ -4217,6 +4289,7 @@ export class SessionTransport {
       }
     } catch (error) {
       if (error && typeof error === "object") Object.assign(error, { inputWritten: true, enterAttempted: enterIssued });
+      if (!enterIssued && error instanceof DeliveryGuardError && error.code === "draft_wake_superseded") await this.holdInputResidue(sessionName, sessionMeta, readTarget, opts);
       throw error;
     }
     try { opts?.onInputEffect?.("submitted"); } catch { /* Observation cannot change a completed submission. */ }

@@ -196,7 +196,7 @@ describe("a failed queue wake when its seat returns", () => {
     expect(after.tags).not.toContain(proof);
     expect(f.sendsFor(f.row.qitemId)).toBe(1);
     expect(String(f.send.mock.calls[1]?.[1])).toContain(`Queue handoff: ${f.row.qitemId}`);
-    expect(String(f.send.mock.calls[1]?.[1])).not.toContain("finish work once");
+    expect(String(f.send.mock.calls[1]?.[1])).toContain(`Body: complete\nClaim: required — rig queue claim '${f.row.qitemId}'\n    finish work once\n---`);
     const audit = f.db.prepare("SELECT transition_note FROM queue_transitions WHERE qitem_id=? AND transition_note LIKE 'queue wake binding reconciled %'").all(f.row.qitemId) as Array<{ transition_note: string }>;
     expect(audit).toHaveLength(1);
     expect(JSON.parse(audit[0]!.transition_note.slice("queue wake binding reconciled ".length)))

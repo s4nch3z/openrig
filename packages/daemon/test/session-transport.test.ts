@@ -665,7 +665,8 @@ describe("SessionTransport", () => {
     expect(sendText).toHaveBeenCalledTimes(1);
     expect(sendText.mock.calls[0]![1]).toContain(item.qitemId);
     expect(sendKeys).toHaveBeenCalledTimes(1);
-    expect(sendKeys.mock.calls[0]).toEqual(["dev-impl@my-rig", ["Enter"]]);
+    // The wake's own check runs before Enter.
+    expect(sendKeys.mock.calls[0]).toEqual(["dev-impl@my-rig", ["Enter"], expect.any(Function)]);
     expect(queue.getById(item.qitemId)?.lastNudgeResult).toBe("verified");
   });
 

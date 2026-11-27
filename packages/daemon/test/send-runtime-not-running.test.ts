@@ -348,7 +348,7 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
     if (identity !== "different-runtime") {
       expect(stored.lastNudgeResult).toBe("delivered-ack-pending");
       expect(sendText).toHaveBeenCalledOnce();
-      expect(sendText).toHaveBeenCalledWith("dev-check@my-rig", expect.stringContaining(`Queue handoff: ${created.qitemId}`));
+      expect(sendText).toHaveBeenCalledWith("dev-check@my-rig", expect.stringContaining(`Queue handoff: ${created.qitemId}`), expect.any(Function));
       expect(sendKeys).toHaveBeenCalledOnce();
     } else {
       expect(stored.lastNudgeResult).toContain("failed:");

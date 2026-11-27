@@ -21,7 +21,7 @@ import { inheritedReturnRoute, issuedReturnAddress, isRouteAddress, RETURN_ROUTE
 import { hostname as osHostname } from "node:os";
 import type { InboxHandler } from "../domain/inbox-handler.js";
 import { InboxHandlerError } from "../domain/inbox-handler.js";
-import { type OutboxHandler } from "../domain/outbox-handler.js";
+import { type OutboxHandler, type OutboxEntry, WAKE_INTENT_PREFIX } from "../domain/outbox-handler.js";
 import { recordRefusal, refusalReason } from "../domain/refusal-trace.js";
 import { aggregateAttention } from "../domain/feed/attention-aggregator.js";
 import type { AttentionItem } from "../domain/feed/attention-aggregator.js";
@@ -162,6 +162,24 @@ export function isAttentionItem(q: { tier: string | null; destinationSession: st
   return q.state === "blocked" && isHumanSeatSessionRef(q.blockedOn ?? "");
 }
 
+
+/** A queue wake's own outbox entries: its staged intent and a held direct send (QueueRepository.performWakeSend). */
+const QUEUE_WAKE_COPY = new RegExp(`^(${WAKE_INTENT_PREFIX}|guard-nudge-)`);
+
+/** A queue wake's outbox copy carries text from its row. A seat reader gets a copy whose row is gone without its text,
+ *  with `bodyHeld`; an erased row's copies are scrubbed by the erasure itself. Every other reader, and every other entry,
+ *  is returned as it is. */
+export function wakeCopyBodyGate(c: Context): <T extends Pick<OutboxEntry, "outboxId" | "auditPointer" | "body">>(entry: T) => T {
+  const repo = c.get("queueRepo" as never) as QueueRepository | undefined;
+  const reader = transportSenderSession(c);
+  return (entry) => {
+    if (!reader || !repo || !QUEUE_WAKE_COPY.test(entry.outboxId)) return entry;
+    if (entry.auditPointer && repo.getById(entry.auditPointer)) return entry;
+    const { body: _body, ...rest } = entry;
+    return { ...rest, bodyHeld: { code: "qitem_unavailable",
+      message: "This queue wake's row is not on this host, so its copied text isn't shown to a seat." } } as unknown as typeof entry;
+  };
+}
 
 /** A row a handoff of this one made: the rows naming it as `handedOffFrom`, and a local row its closure target names. */
 export interface HandoffSuccessor { qitemId: string; destinationSession: string; state: QueueState; via: "handedOffFrom" | "closureTarget" }
@@ -2112,9 +2130,10 @@ export function queueRoutes(): Hono {
     if (!senderSession && !rig) return c.json({ error: "senderSession or rig is required" }, 400);
     const parsed = queryLimit(c);
     if (!parsed.ok) return parsed.response;
-    if (!senderSession) return c.json(getOutbox(c).listForRig(rig!, parsed.limit));
+    const gate = wakeCopyBodyGate(c);
+    if (!senderSession) return c.json(getOutbox(c).listForRig(rig!, parsed.limit).map(gate));
     const sessions = c.get("sessionRegistry" as never) as SessionRegistry | undefined;
-    return c.json(getOutbox(c).listForSender(senderSession, parsed.limit, sessions?.sessionAddresses(senderSession)));
+    return c.json(getOutbox(c).listForSender(senderSession, parsed.limit, sessions?.sessionAddresses(senderSession)).map(gate));
   });
 
   return app;

@@ -180,6 +180,8 @@ async function sendAfterHook(mode: Mode, consumer: "send" | "wake" | "handoff" =
     else {
       const queue = new QueueRepository(db, eventBus, { transport, loadHumanRegistry: () => ({ ok: true, entities: [] }) });
       if (consumer === "wake") {
+        // A wake checks its row before it writes, so the woken row exists.
+        await queue.create({ qitemId: "fixture-q596", sourceSession: "fixture-sender@rotation", destinationSession: name, body: "fixture", nudge: false });
         const wake = await (queue as unknown as {
           performWakeSend(id: string, destination: string, sender: string): Promise<{ classified: string }>;
         }).performWakeSend("fixture-q596", name, "fixture-sender@rotation");

@@ -173,7 +173,9 @@ it.each(modes)("selector and ordinary transport: %s", async (mode) => {
     // Two children of one shim are two runtimes, not a chain.
     if (mode === "launcher-shim-siblings") expect(sent.error).toContain("Multiple Claude processes");
     reads = 0; paneReads = 0;
-    const queue = new QueueRepository(db, eventBus, { transport, loadHumanRegistry: () => ({ ok: true, entities: [] }) });
+    const queue = new QueueRepository(db, eventBus, { transport, validateRig: () => true, loadHumanRegistry: () => ({ ok: true, entities: [] }) });
+    // A wake checks its row before it writes, so the woken row exists.
+    await queue.create({ qitemId: "fixture-q197", sourceSession: "fixture-sender@native-test", destinationSession: name, body: "fixture", nudge: false });
     // Exercise the actual wake consumer without an API, scheduler, or native process.
     const wake = await (queue as unknown as {
       performWakeSend(id: string, destination: string, sender: string): Promise<{ classified: string }>;

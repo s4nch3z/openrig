@@ -24,6 +24,7 @@ import { buildRebuildPrimingChain } from "../domain/rebuild-priming-chain.js";
 import { OPENRIG_HOME } from "../openrig-compat.js";
 import { SettingsStore } from "../domain/user-settings/settings-store.js";
 import { transportSenderSession } from "./require-sender-identity.js";
+import { wakeCopyBodyGate } from "./queue.js";
 import type { SessionTransport } from "../domain/session-transport.js";
 import { DeliveryGuardError, UNATTRIBUTED_GUARD_ACTOR } from "../domain/seat-delivery-guard.js";
 import { PERMISSIONS_DENY } from "../domain/runner-permissions.js";
@@ -145,16 +146,17 @@ seatRoutes.get("/held-messages/:seatRef", c => {
     const target = guard.target(c.req.param("seatRef"));
     const outbox = new OutboxHandler(guard.db);
     const guarded = (c.get("sessionTransport" as never) as SessionTransport | undefined)?.guardedDelivery;
+    const gate = wakeCopyBodyGate(c);
     const id = c.req.query("id");
     if (id) {
       const entry = outbox.getById(id);
       if (entry?.guardBinding?.nodeId !== target.nodeId) return c.json({ error: "No retained history for this node and ID" }, 404);
       const delivery = guarded?.lookup(id);
       const coalesced = outbox.coalescedInto(id);
-      return c.json({ entry, ...(delivery ? { delivery } : {}), ...(coalesced.length > 0 ? { coalesced: { count: coalesced.length, outboxIds: coalesced } } : {}) });
+      return c.json({ entry: gate(entry), ...(delivery ? { delivery } : {}), ...(coalesced.length > 0 ? { coalesced: { count: coalesced.length, outboxIds: coalesced } } : {}) });
     }
     const page = outbox.heldForNode(target.nodeId, Number(c.req.query("limit") ?? 100), Number(c.req.query("offset") ?? 0));
-    return c.json({ ...page, items: page.items.map(entry => {
+    return c.json({ ...page, items: page.items.map(gate).map(entry => {
       const delivery = guarded?.lookup(entry.outboxId);
       return delivery ? { ...entry, delivery } : entry;
     }) });

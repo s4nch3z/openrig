@@ -86,7 +86,7 @@ import { isTypedGateBlocker, typedGateBlockerPrefix } from "./queue-blocker.js";
 export { TYPED_GATE_BLOCKER_PREFIXES, isTypedGateBlocker, typedGateBlockerPrefix } from "./queue-blocker.js";
 import { isOpenRigSender, OPENRIG_SENDER, wrapPaneEnvelope } from "../lib/pane-envelope.js";
 import { isBoundTerminalSeat } from "./terminal-seat.js";
-import { renderQueueHandoffNudge } from "./queue-nudge-text.js";
+import { renderQueueHandoffNudge, withoutQueueWakeBody, type QueueWakeBody } from "./queue-nudge-text.js";
 import { getSelfHostId } from "./hosts/fanout-contract.js";
 import { parseSessionName, isHumanSeatSessionRef } from "./session-name.js";
 import { isEpisodeRelay, RELAY_CLAIMED_PREFIX, RELAY_FOR_PREFIX, RELAY_KEY_PREFIX, RELAY_TAG } from "./return-route.js";
@@ -214,6 +214,11 @@ const FALLBACK_ACTOR = "system:queue-fallback";
 
 /** The actor a terminal act is recorded as when it names no responder: explicitly unattributed, never a person. */
 export const UNATTRIBUTED_ACTOR = "human@host";
+
+/** A row's body as its wake carries it: an erased row's emptied body isn't an authored empty one. */
+export function wakeBody(row: Pick<QueueItem, "body" | "contentErasedAt">): QueueWakeBody {
+  return { text: row.body ?? "", erased: !!row.contentErasedAt };
+}
 
 /**
  * #165: a claim is the destination acting on the row, which is stronger evidence than
@@ -1430,6 +1435,8 @@ export class QueueRepository {
     transport.configureGuardedWakes?.(entries => entries.every(entry => {
       const row = entry.auditPointer ? this.getById(entry.auditPointer) : null;
       if (!row || row.destinationSession !== entry.destinationSession) return false;
+      // Erasure after the wake's text was rendered scrubbed its stored copy: the text in hand may still carry the body.
+      if (row.contentErasedAt && this.outbox?.getById(entry.outboxId)?.body === "") return false;
       return entry.outboxId.startsWith(WAKE_INTENT_PREFIX) ? this.currentWakeIntent(entry) : isBlockerLive(row.state);
     }));
   }
@@ -1677,7 +1684,7 @@ export class QueueRepository {
       fromSession,
       toSession,
       identityProvenance,
-      bareBody: renderQueueHandoffNudge(successorQitemId, successor?.summary),
+      bareBody: renderQueueHandoffNudge(successorQitemId, successor?.summary, successor ? wakeBody(successor) : undefined),
       tags: successor?.handedOffFrom || trigger === "openrig"
         ? [...(successor?.handedOffFrom ? [`queue:return:${successor.handedOffFrom}`] : []), ...(trigger === "openrig" ? [WAKE_TRIGGER_OPENRIG_TAG] : [])]
         : undefined,
@@ -1989,6 +1996,10 @@ export class QueueRepository {
       for (const entry of group) this.outbox.finalizeDelivery(entry.outboxId, "indeterminate");
       return "indeterminate";
     }
+    // One body per delivery: the wake this send was started for (always kept) carries its body; the others in the group
+    // name their rows and say their bodies weren't included.
+    const groupText = (members: OutboxEntry[]): string => members
+      .map((entry, i) => i === 0 || !entry.auditPointer ? entry.body : withoutQueueWakeBody(entry.body, entry.auditPointer)).join("\n");
     const released: OutboxEntry[] = [];
     const recheckMembers = group.length < 2 ? undefined : (holds: (input: import("./seat-delivery-guard.js").AdmissionInput) => boolean, held: boolean) => {
       const keep = group.filter((entry, i) => {
@@ -2006,10 +2017,10 @@ export class QueueRepository {
         })();
         released.push(entry);
       }
-      return { text: recoveryNotice(keep) + keep.map(entry => entry.body).join("\n"), outboxIds: keep.map(entry => entry.outboxId) };
+      return { text: recoveryNotice(keep) + groupText(keep), outboxIds: keep.map(entry => entry.outboxId) };
     };
     const outcome = await this.performWakeSend(
-      qitemId, intent.destinationSession, intent.senderSession, undefined, recoveryNotice(group) + group.map(entry => entry.body).join("\n"), group.map(entry => entry.outboxId),
+      qitemId, intent.destinationSession, intent.senderSession, undefined, recoveryNotice(group) + groupText(group), group.map(entry => entry.outboxId),
       trigger, recheckMembers,
     );
     // A bridged wake isn't confirmed, so the pass counts it as unconfirmed; its row is the bridge's to settle.
@@ -2565,7 +2576,8 @@ export class QueueRepository {
     } else {
       // OPR.0.4.4.19 FR-7: bodyOverride lets the resolve verb carry the
       // decision text to the parked owner; default stays the handoff nudge.
-      const bareBody = bodyOverride ?? renderQueueHandoffNudge(qitemId, null);
+      const row = bodyOverride === undefined ? this.getById(qitemId) : null;
+      const bareBody = bodyOverride ?? renderQueueHandoffNudge(qitemId, null, row ? wakeBody(row) : undefined);
       // GHOST-STAGE (h): the single HG-5 baseline change deferred from g — the handoff nudge now carries
       // a Sent: stamp (so it renders byte-parically with a rig send) plus the SOURCE seat's occupant
       // generation (g's already-wired render, resolved here; absent=UNKNOWN=omit, never forged). The
@@ -6830,7 +6842,7 @@ export class QueueRepository {
             fromSession: OPENRIG_SENDER,
             toSession: fallbackDestination,
             identityProvenance: null,
-            bareBody: renderQueueHandoffNudge(qitemId, qitem.summary),
+            bareBody: renderQueueHandoffNudge(qitemId, qitem.summary, wakeBody(qitem)),
             tags: [WAKE_TRIGGER_OPENRIG_TAG],
           }))();
           wakeId = outboxId;
