@@ -118,8 +118,8 @@ describe("wake claim admission remains true at its own payload", () => {
     } finally { off(); f.close(); }
   });
 
-  it.each(["occupant", "pane"] as const)("rechecks %s authority changed by a claim subscriber before the own paste", async change => {
-    const f = await fixture();
+  it.each([false, true].flatMap(native => (["occupant", "pane"] as const).map(change => ({ native, change }))))("rechecks $change authority after claim (native=$native)", async ({ native, change }) => {
+    const f = await fixture(undefined, native);
     let changed = false;
     const off = f.bus.subscribe(event => {
       if (event.type !== "queue.claimed" || event.qitemId !== f.row.qitemId) return;
@@ -131,6 +131,7 @@ describe("wake claim admission remains true at its own payload", () => {
       await f.repo.drainPendingWakeIntents();
       expect(changed).toBe(true);
       expect(f.pasted).toEqual([]); // the row claim still matches, but its recipient authority does not
+      if (native) expect(f.outbox.runnerReceipt(`wake-intent-${f.row.qitemId}`)).toBeNull();
       expect(f.state()).toBe("pending"); // positively no own input: return this untouched claim
     } finally { off(); f.close(); }
   });
